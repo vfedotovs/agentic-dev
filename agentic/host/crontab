@@ -1,0 +1,42 @@
+# agentic-dev pipeline crontab
+# -----------------------------------------------------------------------------
+# Install for a dedicated unprivileged user that is in the `docker` group:
+#
+#   sudo useradd -r -m -G docker agentic
+#   sudo install -d -o agentic -g agentic /var/lib/agentic-dev/runs /var/log/agentic-dev
+#   sudo install -d -m 750 /etc/agentic-dev
+#   sudo cp agentic/host/agentic-dev.env.example /etc/agentic-dev/agentic-dev.env
+#   sudo chown agentic:agentic /etc/agentic-dev/agentic-dev.env
+#   sudo chmod 600 /etc/agentic-dev/agentic-dev.env      # then edit it
+#   sudo git clone <this-repo> /opt/agentic-dev          # provides /opt/agentic-dev/agentic/host/run-stage.sh
+#   docker build -t agentic-dev:latest /opt/agentic-dev
+#   sudo -u agentic crontab agentic/host/crontab
+#
+# Times are host-local. The three stages are spaced so each finishes before the
+# next starts (Stage 2/3 can run ~10 containers back-to-back).
+# -----------------------------------------------------------------------------
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+AGENTIC_ENV_FILE=/etc/agentic-dev/agentic-dev.env
+AGENTIC_IMAGE=agentic-dev:latest
+AGENTIC_RUNS_DIR=/var/lib/agentic-dev/runs
+MAX_PER_DAY=10
+RUN=/opt/agentic-dev/agentic/host/run-stage.sh
+LOG=/var/log/agentic-dev
+
+# ── Stage 1 ── slice plan.md into GitHub issues ───────────────────────  06:00 daily
+0 6 * * *   $RUN slice        >> $LOG/slice.log        2>&1
+
+# ── Stage 2 ── write failing tests for up to MAX_PER_DAY issues ───────  08:00 daily
+0 8 * * *   $RUN write-tests  >> $LOG/write-tests.log  2>&1
+
+# ── Stage 3 ── implement + open PRs for up to MAX_PER_DAY issues ──────  12:00 daily
+0 12 * * *  $RUN implement    >> $LOG/implement.log    2>&1
+
+# ── gc ── retire stale agent branches/PRs, unstick dead in-progress ───  02:00 daily
+# Reports only until you set GC_DRY_RUN=0 in the env file.
+0 2 * * *   $RUN gc          >> $LOG/gc.log           2>&1
+
+# ── optional weekly log truncation ─────────────────────────────────  Mon 02:30
+# 30 2 * * 1  find $LOG -name '*.log' -size +50M -exec truncate -s 0 {} \;

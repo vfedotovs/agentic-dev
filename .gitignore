@@ -1,0 +1,12 @@
+# Local secrets — never commit
+agentic-dev.env
+*.env
+!agentic/host/agentic-dev.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime state (created on the host / in containers)
+runs/
+*.log
