@@ -27,6 +27,10 @@ clone_repo() { # echoes the checkout path on stdout; all noise goes to stderr
   gh repo clone "$REPO" "$dir" -- --depth "${CLONE_DEPTH:-50}" --no-single-branch >&2
   git -C "$dir" config user.name  "${GIT_AUTHOR_NAME:-agentic-dev bot}"
   git -C "$dir" config user.email "${GIT_AUTHOR_EMAIL:-agentic-dev@users.noreply.github.com}"
+  # The pipeline's own scratch dir lives inside the checkout. Hide it from git so
+  # it neither trips Stage 2's "only tests/ may change" guard nor gets swept into
+  # `git add -A`. Repo-local, so the target repo's .gitignore is untouched.
+  printf '.agent/\n' >> "$dir/.git/info/exclude"
   git -C "$dir" fetch --all --prune >&2
   echo "$dir"
 }
