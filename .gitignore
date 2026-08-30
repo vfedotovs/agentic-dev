@@ -10,3 +10,4 @@ __pycache__/
 # Runtime state (created on the host / in containers)
 runs/
 *.log
+parse-out
