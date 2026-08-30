@@ -19,8 +19,19 @@ IMAGE="${AGENTIC_IMAGE:-agentic-dev:latest}"
 RUNS_DIR="${AGENTIC_RUNS_DIR:-/var/lib/agentic-dev/runs}"
 
 [[ -f "$ENV_FILE" ]] || { echo "run-stage: missing env file $ENV_FILE" >&2; exit 1; }
+# Knobs the caller passed in (e.g. `make slice-dry` sets SLICER_DRY_RUN=1) must
+# win over the env file: `set -a; source` would otherwise clobber them with the
+# file's own values, silently turning a dry run into a live one.
+_overrides=()
+for _v in SLICER_DRY_RUN GC_DRY_RUN MAX_ISSUES MAX_PER_DAY AGENTIC_DISABLED; do
+  [[ -v "$_v" ]] && _overrides+=("$_v=${!_v}")
+done
+
 set -a; # shellcheck disable=SC1090
 source "$ENV_FILE"; set +a
+
+for _kv in ${_overrides+"${_overrides[@]}"}; do export "${_kv?}"; done
+unset _overrides _v _kv
 
 : "${REPO:?set REPO in $ENV_FILE}"
 : "${GH_TOKEN:?set GH_TOKEN in $ENV_FILE}"
