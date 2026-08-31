@@ -9,7 +9,7 @@
 #   sudo chown agentic:agentic /etc/agentic-dev/agentic-dev.env
 #   sudo chmod 600 /etc/agentic-dev/agentic-dev.env      # then edit it
 #   sudo git clone <this-repo> /opt/agentic-dev          # provides /opt/agentic-dev/agentic/host/run-stage.sh
-#   docker build -t agentic-dev:latest /opt/agentic-dev
+#   make -C /opt/agentic-dev build-claude   # or build-grok for the xAI backend
 #   sudo -u agentic crontab agentic/host/crontab
 #
 # Times are host-local. The three stages are spaced so each finishes before the
@@ -19,6 +19,8 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 AGENTIC_ENV_FILE=/etc/agentic-dev/agentic-dev.env
+# Must match AGENT_BACKEND in the env file: agentic-dev:claude-latest (also
+# published as agentic-dev:latest) or agentic-dev:grok-latest.
 AGENTIC_IMAGE=agentic-dev:latest
 AGENTIC_RUNS_DIR=/var/lib/agentic-dev/runs
 MAX_PER_DAY=10

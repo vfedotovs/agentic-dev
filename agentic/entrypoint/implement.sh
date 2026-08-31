@@ -4,8 +4,11 @@
 # Run one container per issue. Humans are the only merge gate: no auto-merge.
 #
 # Env:
-#   REPO   GH_TOKEN   ANTHROPIC_API_KEY        (required)
+#   REPO   GH_TOKEN                           (required)
 #   ISSUE  issue number to process             (required)
+#   AGENT_BACKEND        claude | grok         (default claude)
+#   ANTHROPIC_API_KEY    required when AGENT_BACKEND=claude
+#   XAI_API_KEY          required when AGENT_BACKEND=grok
 #   MAX_PER_DAY   daily quota for this stage   (default 10)
 #
 set -euo pipefail
@@ -14,7 +17,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HERE/../lib/common.sh"
 
-require_env REPO GH_TOKEN ANTHROPIC_API_KEY ISSUE
+require_env REPO GH_TOKEN ISSUE
+require_agent_env
 
 quota_reached "$STAGE" && die "daily quota (${MAX_PER_DAY:-10}) already reached"
 
@@ -47,7 +51,7 @@ mkdir -p .agent
 jq -r .body <<<"$meta" > .agent/issue.md
 git diff "origin/$base...HEAD" -- tests/ conftest.py > .agent/tests.patch || true
 
-run_claude "Read .agent/issue.md (the issue) and .agent/tests.patch (failing tests
+run_agent "Read .agent/issue.md (the issue) and .agent/tests.patch (failing tests
 already committed to this branch).
 
 Implement the change so the tests pass. Rules:
