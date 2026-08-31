@@ -5,7 +5,9 @@
 # Env:
 #   REPO                owner/name                    (required)
 #   GH_TOKEN            GitHub token, repo+issues     (required)
-#   ANTHROPIC_API_KEY   Claude API key               (required)
+#   AGENT_BACKEND       claude | grok                     (default claude)
+#   ANTHROPIC_API_KEY   Claude API key    (required when AGENT_BACKEND=claude)
+#   XAI_API_KEY         xAI API key       (required when AGENT_BACKEND=grok)
 #   SLICER_DRY_RUN      1 = print, do not create issues   (default 0)
 #   MAX_ISSUES          hard cap on issues per run        (default 25)
 #
@@ -15,7 +17,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HERE/../lib/common.sh"
 
-require_env REPO GH_TOKEN ANTHROPIC_API_KEY
+require_env REPO GH_TOKEN
+require_agent_env
 MAX_ISSUES="${MAX_ISSUES:-25}"
 DRY_RUN="${SLICER_DRY_RUN:-0}"
 
@@ -49,7 +52,7 @@ while IFS=$'\t' read -r fp type text; do
   fi
 
   rm -f .agent/issue.json
-  run_claude "You are expanding ONE action item from plan.md into a GitHub issue
+  run_agent "You are expanding ONE action item from plan.md into a GitHub issue
 for a Python project.
 
 Action item: \"$text\"

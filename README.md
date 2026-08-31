@@ -10,9 +10,11 @@ plan.md ─▶ [1 slice] ─▶ GitHub issues ─▶ [2 write-tests] ─▶ fail
                                               [gc] daily: retire stale branches/PRs, unstick dead runs
 ```
 
-Each stage runs the `claude` CLI inside a disposable Docker container, does one
-unit of work, and hands off through **issues** and **branches/PRs** — never
-shared local state. See [`agentic-dev-plan.md`](agentic-dev-plan.md) for the
+Each stage runs an agent CLI — `claude` (Anthropic) or `grok`
+([xai-org/grok-build](https://github.com/xai-org/grok-build)), selected with
+`AGENT_BACKEND` — inside a disposable Docker container, does one unit of work,
+and hands off through **issues** and **branches/PRs** — never shared local
+state. See [`agentic-dev-plan.md`](agentic-dev-plan.md) for the
 full design rationale, label state machine, rollout plan, and failure-mode
 analysis.
 
@@ -23,7 +25,7 @@ analysis.
 ```
 agentic-dev-plan.md            design doc (read this for the "why")
 README.md                      this file
-Dockerfile                     builds agentic-dev:latest
+Dockerfile                     builds agentic-dev:{claude,grok}-latest
 Makefile                       build / run / operate targets (`make help`)
 examples/plan.md               sample plan.md the slicer consumes
 agentic/
@@ -49,7 +51,10 @@ agentic/
   (`run-stage.sh` uses `gh`/`jq` on the host; the containers carry their own).
 - A **GitHub token** (classic or fine-grained) for the target repo with:
   `contents: read/write`, `issues: read/write`, `pull_requests: read/write`.
-- An **Anthropic API key** with budget for ~10–20 agent runs/day.
+- An API key for the agent backend you pick, with budget for ~10–20 runs/day:
+  an **Anthropic API key** (`AGENT_BACKEND=claude`, the default) **or** an
+  **xAI API key** from [console.x.ai](https://console.x.ai)
+  (`AGENT_BACKEND=grok`). Only the selected backend's key is needed.
 - The target repo must use **`pytest`**, and ideally `ruff` / `black` / `mypy`
   (Stage 3's acceptance gate runs whichever are present).
 
@@ -81,13 +86,27 @@ PRs; nothing merges without a human.
 
 ### 2. Build the image
 
+One image carries one agent runtime, so build the one matching the backend you
+intend to run:
+
 ```bash
 git clone <this-repo> /opt/agentic-dev
-docker build -t agentic-dev:latest /opt/agentic-dev
+cd /opt/agentic-dev
+
+make build-claude     # agentic-dev:claude-latest  (also tagged agentic-dev:latest)
+make build-grok       # agentic-dev:grok-latest
+make build-all        # both
 ```
 
 Pin the CLI if you want reproducibility:
-`docker build --build-arg CLAUDE_CODE_VERSION=x.y.z -t agentic-dev:latest .`
+
+```bash
+make build-claude CLAUDE_CODE_VERSION=x.y.z
+make build-grok   GROK_CLI_VERSION=x.y.z
+```
+
+`make build` remains an alias for `build-claude` and still publishes the
+`agentic-dev:latest` tag, so existing cron installs need no change.
 
 ### 3. Host user, directories, env file
 
@@ -98,7 +117,8 @@ sudo install -d -m 750 /etc/agentic-dev
 sudo cp /opt/agentic-dev/agentic/host/agentic-dev.env.example /etc/agentic-dev/agentic-dev.env
 sudo chown agentic:agentic /etc/agentic-dev/agentic-dev.env
 sudo chmod 600 /etc/agentic-dev/agentic-dev.env
-sudoedit /etc/agentic-dev/agentic-dev.env      # set REPO, GH_TOKEN, ANTHROPIC_API_KEY
+sudoedit /etc/agentic-dev/agentic-dev.env      # set REPO, GH_TOKEN, AGENT_BACKEND
+                                              # + that backend's API key
 ```
 
 Key env-file settings (full list in the template):
@@ -106,7 +126,12 @@ Key env-file settings (full list in the template):
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `REPO` | — | `owner/name` of the target repo |
-| `GH_TOKEN` / `ANTHROPIC_API_KEY` | — | credentials, container env only |
+| `GH_TOKEN` | — | GitHub credentials, container env only |
+| `AGENT_BACKEND` | `claude` | agent runtime: `claude` or `grok`; must match the image |
+| `ANTHROPIC_API_KEY` | — | required when `AGENT_BACKEND=claude`, container env only |
+| `XAI_API_KEY` | — | required when `AGENT_BACKEND=grok`, container env only |
+| `GROK_MODEL` | — | optional model for the `grok` backend, e.g. `grok-4.6` |
+| `AGENT_MAX_TURNS` | — | override the per-stage turn cap (30/60/120) |
 | `MAX_PER_DAY` | 10 | Stage 2 & 3 issue cap per day |
 | `MAX_ISSUES` | 25 | Stage 1 hard cap on issues created per run |
 | `SLICER_DRY_RUN` | 0 | `1` = Stage 1 prints planned issues, creates none |
@@ -147,6 +172,8 @@ Most of the below is wrapped by the **Makefile** — `make help` lists every
 target. Examples: `make build`, `make slice-dry`, `make write-tests`,
 `make gc-apply`, `make status REPO=$REPO`, `make run-issue STAGE=implement ISSUE=42`.
 Override `ENV_FILE` / `IMAGE` / `RUNS_DIR` on the command line for a dev setup.
+`AGENT_BACKEND=grok make write-tests` selects both the Grok image and the Grok
+runtime for that run, overriding whatever the env file says.
 
 ### Watch it run
 
@@ -180,9 +207,17 @@ The daily `MAX_PER_DAY` budget is shared with the cron run (counted from
 
 ```bash
 docker run --rm -it \
-  -e REPO="$REPO" -e GH_TOKEN=… -e ANTHROPIC_API_KEY=… -e ISSUE=42 \
+  -e REPO="$REPO" -e GH_TOKEN=… -e ISSUE=42 \
+  -e AGENT_BACKEND=claude -e ANTHROPIC_API_KEY=… \
   -v /var/lib/agentic-dev/runs:/runs \
-  agentic-dev:latest write-tests.sh          # or implement.sh
+  agentic-dev:claude-latest write-tests.sh   # or implement.sh
+
+# the same thing on the Grok backend
+docker run --rm -it \
+  -e REPO="$REPO" -e GH_TOKEN=… -e ISSUE=42 \
+  -e AGENT_BACKEND=grok -e XAI_API_KEY=… \
+  -v /var/lib/agentic-dev/runs:/runs \
+  agentic-dev:grok-latest write-tests.sh
 ```
 
 ### Pause / resume
@@ -239,7 +274,12 @@ sudo -u agentic crontab -r
 - Containers run as non-root (`uid 10001`), `--cap-drop ALL`,
   `--security-opt no-new-privileges`, `--pids-limit`, memory/CPU caps, and a
   hard wallclock `timeout` that SIGKILLs a wedged agent.
-- Restrict container egress to GitHub + the Anthropic API via `AGENTIC_NET`
-  (point it at a locked-down Docker network).
+- Restrict container egress to GitHub + your backend's API via `AGENTIC_NET`
+  (point it at a locked-down Docker network): `api.anthropic.com` for the
+  `claude` backend, `api.x.ai` for `grok`. Building the Grok image also needs
+  `x.ai` and `storage.googleapis.com` reachable, but that is build time only.
+- The Grok image ships no `~/.grok/auth.json`; `grok` would prefer a stored
+  session token over `XAI_API_KEY`, so the absence of that file is what keeps
+  the key authoritative. The Dockerfile asserts it at build time.
 - The agent can only push `agent/*` branches and open PRs. Branch protection is
   what actually prevents an unreviewed merge — configure it.

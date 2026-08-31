@@ -40,7 +40,8 @@ RUNS_DIR="${RUNS_DIR:-/runs}"
 # Relies on RUNS_DIR being a persistent mount shared by all containers of the
 # stage.
 quota_reached() { # quota_reached <stage>
-  local f="$RUNS_DIR/$1/$(date +%F).jsonl" n=0
+  local f n=0
+  f="$RUNS_DIR/$1/$(date +%F).jsonl"
   [[ -f "$f" ]] && n=$(wc -l < "$f")
   (( n >= ${MAX_PER_DAY:-10} ))
 }
@@ -51,17 +52,78 @@ budget_guard() {
   timeout --signal=SIGKILL "${CONTAINER_TIMEOUT:-1200}" "$@"
 }
 
-# Wrapper around the Claude CLI used by every stage. Reads ANTHROPIC_API_KEY
-# from the env. `--dangerously-skip-permissions` is acceptable ONLY because the
-# container is disposable, network-restricted, and has no host mounts beyond the
-# checkout and the write-only runs/ dir.
-run_claude() { # run_claude <prompt> [extra claude args...]
+# Which agent runtime the stages drive: 'claude' (Anthropic) or 'grok' (xAI).
+# Set it in the env file. The image is built for one backend, so this must match
+# the image the container was started from.
+AGENT_BACKEND="${AGENT_BACKEND:-claude}"
+
+# Fail fast unless the API key for the selected backend is present AND that
+# backend's CLI is actually in this image. Each backend needs only its own key,
+# so a Grok-only host never has to carry an Anthropic one. The CLI check turns an
+# env-file/image mismatch into a clear error at startup rather than a bare
+# "command not found" once the stage is already mid-run.
+require_agent_env() {
+  local cli
+  case "$AGENT_BACKEND" in
+    claude) require_env ANTHROPIC_API_KEY; cli=claude ;;
+    grok)   require_env XAI_API_KEY;       cli=grok ;;
+    *) die "unknown AGENT_BACKEND '$AGENT_BACKEND' (expected 'claude' or 'grok')" ;;
+  esac
+  command -v "$cli" >/dev/null \
+    || die "AGENT_BACKEND=$AGENT_BACKEND but '$cli' is not in this image; run the matching image (make build-$AGENT_BACKEND)"
+}
+
+# Wrapper around the agent CLI used by every stage. The prompt goes in on the
+# command line and results come back as files the agent writes into the checkout
+# (.agent/*.json), so the CLI's own stdout is discarded for both backends.
+#
+# Auto-approval (`--dangerously-skip-permissions` / `--yolo`) is acceptable ONLY
+# because the container is disposable, network-restricted, and has no host mounts
+# beyond the checkout and the write-only runs/ dir.
+run_agent() { # run_agent <prompt> [extra agent args...]
   local prompt="$1"; shift
-  budget_guard claude -p "$prompt" \
-    --output-format json \
-    --dangerously-skip-permissions \
-    --max-turns "${CLAUDE_MAX_TURNS:-60}" \
-    "$@" >/dev/null
+
+  # Resolve the turn cap once instead of emitting --max-turns twice and relying
+  # on each CLI's last-flag-wins parsing:
+  #   AGENT_MAX_TURNS (env) > the caller's per-stage --max-turns > 60.
+  local turns=''
+  local -a args=()
+  while (( $# )); do
+    case "$1" in
+      --max-turns)   turns="$2"; shift 2 ;;
+      --max-turns=*) turns="${1#*=}"; shift ;;
+      *)             args+=("$1"); shift ;;
+    esac
+  done
+  turns="${AGENT_MAX_TURNS:-${CLAUDE_MAX_TURNS:-${turns:-60}}}"
+
+  local -a cmd
+  case "$AGENT_BACKEND" in
+    claude)
+      cmd=(claude -p "$prompt"
+           --output-format json
+           --dangerously-skip-permissions
+           --max-turns "$turns")
+      ;;
+    grok)
+      # `grok` prefers a session token in ~/.grok/auth.json over XAI_API_KEY; the
+      # image ships no such file, so the key is always what authenticates.
+      # --no-auto-update stops a disposable container re-downloading the binary.
+      cmd=(grok -p "$prompt"
+           --output-format json
+           --yolo
+           --no-auto-update
+           --max-turns "$turns")
+      if [[ -n "${GROK_MODEL:-}" ]]; then cmd+=(--model "$GROK_MODEL"); fi
+      ;;
+    *)
+      die "unknown AGENT_BACKEND '$AGENT_BACKEND' (expected 'claude' or 'grok')"
+      ;;
+  esac
+
+  # ${args[@]+...} keeps an empty array safe under `set -u` on bash < 4.4.
+  cmd+=(${args[@]+"${args[@]}"})
+  budget_guard "${cmd[@]}" >/dev/null
 }
 
 jlog() { # jlog <stage> <json-object-without-braces>

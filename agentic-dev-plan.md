@@ -23,8 +23,8 @@ plan.md ──▶ [1] slicer ──▶ GitHub issues ──▶ [2] test-writer �
 | Concern | Decision |
 | --- | --- |
 | Orchestration | 3 cron jobs on the CI host (systemd timers or crontab). Each is a shell entrypoint that runs a Docker container. |
-| Agent runtime | `claude` CLI inside a pinned Docker image (`agentic-dev:latest`). |
-| Auth | `ANTHROPIC_API_KEY` and a scoped GitHub token (`repo`, `issues`) injected as env vars from the host secret store. Never baked into the image. |
+| Agent runtime | One agent CLI inside a pinned Docker image, selected by `AGENT_BACKEND`: `claude` (Anthropic, `agentic-dev:claude-latest`) or `grok` ([xai-org/grok-build](https://github.com/xai-org/grok-build), `agentic-dev:grok-latest`). One image carries one runtime; `AGENT_BACKEND` is baked in as the image default so a container cannot disagree with the binary it holds. |
+| Auth | A scoped GitHub token (`repo`, `issues`) plus the selected backend's API key — `ANTHROPIC_API_KEY` or `XAI_API_KEY` — injected as env vars from the host secret store. Never baked into the image. The Grok image deliberately ships no `~/.grok/auth.json`, since a stored session token would outrank `XAI_API_KEY`. |
 | Repo access | Each job does a fresh `gh repo clone` (or `git clone --depth=50`) into a container-local workdir. No long-lived checkout. |
 | Idempotency | Every stage marks its output (issue labels, branch names, PR body markers) so re-runs skip already-processed work. |
 | Rate limiting | Stage 2 and Stage 3 process **at most 10 issues per calendar day**, tracked via a label + a `processed-on:<date>` marker. |
@@ -205,7 +205,9 @@ Skip `agent-skip` / `agent-failed`.
 
 ```
 agentic-dev-plan.md          # this document
-Dockerfile                   # builds agentic-dev:latest (python + gh + node + claude CLI)
+Dockerfile                   # builds agentic-dev:{claude,grok}-latest
+                             #   claude: python + gh + node + claude CLI
+                             #   grok:   python + gh + grok CLI (prebuilt binary)
 examples/plan.md             # sample plan.md the slicer consumes
 agentic/
   entrypoint/                # run INSIDE the container, one unit of work each
@@ -214,30 +216,35 @@ agentic/
     implement.sh             # Stage 3  (env: ISSUE)
     gc.sh                    # housekeeping: stale branches/PRs, stuck issues
   lib/
-    common.sh                # shared bash helpers (clone, quota, budget, claude wrapper)
+    common.sh                # shared bash helpers (clone, quota, budget, agent-backend dispatch)
     parse_plan.py            # plan.md checklist -> TSV (fingerprint, type, text)
   host/                      # run ON the cron host
     run-stage.sh             # selects work with `gh`, launches one container per unit
     crontab                  # the three schedule lines + install notes
-    agentic-dev.env.example  # env-file template (REPO, GH_TOKEN, ANTHROPIC_API_KEY, caps)
+    agentic-dev.env.example  # env-file template (REPO, GH_TOKEN, AGENT_BACKEND,
+                             #   ANTHROPIC_API_KEY / XAI_API_KEY, caps)
 ```
 
-Each entrypoint expects `REPO`, `GH_TOKEN`, `ANTHROPIC_API_KEY` in the
-environment; Stage 2/3 also take `ISSUE`. `run-stage.sh` sources the env file,
+Each entrypoint expects `REPO`, `GH_TOKEN`, and the API key for the selected
+`AGENT_BACKEND` in the environment; Stage 2/3 also take `ISSUE`. `run-stage.sh` sources the env file,
 enforces the daily cap, and passes these through to `docker run`. See the header
 comment in each script for the full contract.
 
-## Docker image (`agentic-dev:latest`)
+## Docker image (`agentic-dev:{claude,grok}-latest`)
 
 Contains:
 
 - Python (matching the project's `.python-version`) + `pip`/`uv`.
 - `pytest`, `ruff`, `black`, `mypy`, `coverage`.
 - `git`, `gh` CLI.
-- `claude` CLI (pinned version).
+- Exactly one agent CLI, pinned: `claude` (via npm, needs Node) **or** `grok`
+  (prebuilt binary from `x.ai/cli/install.sh`; building it from source would
+  need the pinned Rust toolchain plus DotSlash for hermetic `protoc`).
 - `entrypoint/` scripts: `slice.sh`, `write-tests.sh`, `implement.sh`.
 
-Build: `docker build -t agentic-dev:latest .`
+Build: `make build-claude`, `make build-grok`, or `make build-all`.
+`make build` stays an alias for the Claude image and keeps publishing the
+`agentic-dev:latest` tag for existing cron installs.
 
 Runtime contract for every container (this is what `agentic/host/run-stage.sh`
 issues):
@@ -248,20 +255,22 @@ docker run --rm \
   --memory 4g --cpus 2 --pids-limit 512 \
   --stop-timeout 1200 \
   --cap-drop ALL --security-opt no-new-privileges \
-  -e REPO -e GH_TOKEN -e ANTHROPIC_API_KEY \
+  -e REPO -e GH_TOKEN \
+  -e AGENT_BACKEND -e ANTHROPIC_API_KEY -e XAI_API_KEY -e GROK_MODEL \
   -e MAX_PER_DAY -e CONTAINER_TIMEOUT -e RUNS_DIR=/runs \
   -e ISSUE=<n> \                         # Stage 2 / 3 only
   -v /var/lib/agentic-dev/runs:/runs \   # persistent quota + run log
-  agentic-dev:latest <slice.sh|write-tests.sh|implement.sh>
+  agentic-dev:<backend>-latest <slice.sh|write-tests.sh|implement.sh>
 ```
 
 - Runs as non-root `agent` (uid 10001). `tini` as PID 1 reaps the
-  Claude/pytest tree on the budget-guard SIGKILL.
+  agent/pytest tree on the budget-guard SIGKILL.
 - Only mount is the write-through `/runs` dir (holds
   `runs/<stage>/<date>.jsonl`, which is also how the daily cap is
   counted). Secrets come in as env vars, never a file or image layer.
-- Egress restricted to GitHub + Anthropic API where the network policy
-  allows it (`AGENTIC_NET`).
+- Egress restricted to GitHub + the selected backend's API where the network
+  policy allows it (`AGENTIC_NET`): `api.anthropic.com` for `claude`,
+  `api.x.ai` for `grok`.
 
 ---
 

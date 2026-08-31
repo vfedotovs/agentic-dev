@@ -4,8 +4,11 @@
 # Run one container per issue. No application code is written here.
 #
 # Env:
-#   REPO   GH_TOKEN   ANTHROPIC_API_KEY        (required)
+#   REPO   GH_TOKEN                           (required)
 #   ISSUE  issue number to process             (required)
+#   AGENT_BACKEND        claude | grok         (default claude)
+#   ANTHROPIC_API_KEY    required when AGENT_BACKEND=claude
+#   XAI_API_KEY          required when AGENT_BACKEND=grok
 #   MAX_PER_DAY   daily quota for this stage   (default 10)
 #
 set -euo pipefail
@@ -14,7 +17,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HERE/../lib/common.sh"
 
-require_env REPO GH_TOKEN ANTHROPIC_API_KEY ISSUE
+require_env REPO GH_TOKEN ISSUE
+require_agent_env
 
 quota_reached "$STAGE" && die "daily quota (${MAX_PER_DAY:-10}) already reached"
 
@@ -35,7 +39,7 @@ git checkout -b "$branch" "origin/$base"
 mkdir -p .agent
 jq -r .body <<<"$meta" > .agent/issue.md
 
-run_claude "Read .agent/issue.md — a GitHub issue for this Python project.
+run_agent "Read .agent/issue.md — a GitHub issue for this Python project.
 
 Write pytest tests (under tests/) that will pass ONLY once the described change
 is correctly implemented. Cover every acceptance criterion. You MAY add fixtures,

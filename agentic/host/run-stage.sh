@@ -8,7 +8,9 @@
 #   run-stage.sh implement      # Stage 3 — up to MAX_PER_DAY issues
 #
 # Config comes from the env file (default /etc/agentic-dev/agentic-dev.env),
-# which must define REPO, GH_TOKEN, ANTHROPIC_API_KEY. See agentic-dev.env.example.
+# which must define REPO, GH_TOKEN, and the API key for the selected
+# AGENT_BACKEND (ANTHROPIC_API_KEY for 'claude', XAI_API_KEY for 'grok').
+# See agentic-dev.env.example.
 #
 set -euo pipefail
 
@@ -19,13 +21,28 @@ IMAGE="${AGENTIC_IMAGE:-agentic-dev:latest}"
 RUNS_DIR="${AGENTIC_RUNS_DIR:-/var/lib/agentic-dev/runs}"
 
 [[ -f "$ENV_FILE" ]] || { echo "run-stage: missing env file $ENV_FILE" >&2; exit 1; }
+
+# An AGENT_BACKEND already in the caller's environment (e.g. `make write-tests
+# AGENT_BACKEND=grok`, which also picks the matching AGENTIC_IMAGE) must win over
+# the env file — otherwise the backend could disagree with the image being run.
+backend_override="${AGENT_BACKEND:-}"
 set -a; # shellcheck disable=SC1090
 source "$ENV_FILE"; set +a
+if [[ -n "$backend_override" ]]; then AGENT_BACKEND="$backend_override"; fi
 
 : "${REPO:?set REPO in $ENV_FILE}"
 : "${GH_TOKEN:?set GH_TOKEN in $ENV_FILE}"
-: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in $ENV_FILE}"
 export GH_TOKEN                      # used by `gh` on the host too
+
+# Only the selected backend's key is required, so a Grok-only host never has to
+# carry an Anthropic key (or the reverse).
+AGENT_BACKEND="${AGENT_BACKEND:-claude}"
+case "$AGENT_BACKEND" in
+  claude) : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in $ENV_FILE (AGENT_BACKEND=claude)}" ;;
+  grok)   : "${XAI_API_KEY:?set XAI_API_KEY in $ENV_FILE (AGENT_BACKEND=grok)}" ;;
+  *) echo "run-stage: unknown AGENT_BACKEND '$AGENT_BACKEND' (expected 'claude' or 'grok')" >&2; exit 2 ;;
+esac
+export AGENT_BACKEND
 
 MAX_PER_DAY="${MAX_PER_DAY:-10}"
 CONTAINER_TIMEOUT="${CONTAINER_TIMEOUT:-1200}"
@@ -39,16 +56,18 @@ mkdir -p "$RUNS_DIR"
 # ---- container invocation --------------------------------------------------
 docker_run() { # docker_run <entrypoint-script> [extra docker args...]
   local entry="$1"; shift
-  # Hardening you can add once verified against the Claude CLI's state dir:
+  # Hardening you can add once verified against the agent CLI's state dir
+  # (~/.claude for the claude backend, ~/.grok for grok):
   #   --read-only --tmpfs /tmp --tmpfs /work --tmpfs /home/agent
   docker run --rm \
     --network "${AGENTIC_NET:-bridge}" \
     --memory "${AGENTIC_MEM:-4g}" --cpus "${AGENTIC_CPUS:-2}" --pids-limit 512 \
     --stop-timeout "$CONTAINER_TIMEOUT" \
     --cap-drop ALL --security-opt no-new-privileges \
-    -e REPO -e GH_TOKEN -e ANTHROPIC_API_KEY \
+    -e REPO -e GH_TOKEN \
+    -e AGENT_BACKEND -e ANTHROPIC_API_KEY -e XAI_API_KEY -e GROK_MODEL \
     -e MAX_PER_DAY -e CONTAINER_TIMEOUT -e RUNS_DIR=/runs \
-    -e CLAUDE_MAX_TURNS -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL \
+    -e AGENT_MAX_TURNS -e CLAUDE_MAX_TURNS -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL \
     -v "$RUNS_DIR:/runs" \
     "$@" \
     "$IMAGE" "$entry"
@@ -66,6 +85,7 @@ count_today() { # count_today <stage>
 select_issues() { # select_issues <limit> <ready-label> [type-labels]
   local limit="$1" ready="$2" types="${3:-}"
   local types_json='[]'
+  # shellcheck disable=SC2086  # $types is a space-separated list; splitting is the point
   [[ -n "$types" ]] && types_json="$(printf '%s\n' $types | jq -Rc . | jq -sc .)"
 
   gh issue list --repo "$REPO" --state open --label "$ready" \
