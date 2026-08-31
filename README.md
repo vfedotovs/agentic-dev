@@ -161,7 +161,7 @@ Default times (host-local): `gc` 02:00, `slice` 06:00, `write-tests` 08:00,
 | --- | --- | --- | --- | --- |
 | **1 slice** | daily | `plan.md` unchecked items | issues labelled `agent-generated`,`needs-tests`,`<type>` | fingerprint dedupe; `MAX_ISSUES` cap; `SLICER_DRY_RUN` |
 | **2 write-tests** | daily, ≤`MAX_PER_DAY` | issue `needs-tests` + type ∈ {feature,bug,refactor} | branch `agent/tests/<n>-<slug>` with **failing** pytest tests; label → `tests-ready` | diff must touch only `tests/` + `conftest.py`; new tests must actually fail (else `needs-triage`) |
-| **3 implement** | daily, ≤`MAX_PER_DAY` | issue `tests-ready` | PR `Closes #<n>`, label → `agent-pr-open` | rebases onto base first; gate = pytest + ruff + black + mypy + tests-unchanged; failure → **draft** PR + `agent-failed` |
+| **3 implement** | daily, ≤`MAX_PER_DAY` | issue `tests-ready` | PR `Closes #<n>`, label → `agent-pr-open` | rebases onto base first (a conflict confined to `tests/` is merged by the agent and re-checked; anything else stops for a human); gate = pytest + ruff + black + mypy + tests-unchanged; failure → **draft** PR + `agent-failed` |
 | **gc** | daily | — | deletes stale/merged `agent/*` branches, closes inactive agent PRs, resets stuck `in-progress` issues | only touches `agent/tests/*` `agent/impl/*`; `GC_DRY_RUN` |
 
 Humans interact by: reviewing/merging PRs, adding **`agent-skip`** to any issue
@@ -410,7 +410,7 @@ sudo -u agentic crontab -r
 | Stage 2 labels issue `needs-triage` | New tests passed immediately — behaviour may already exist; a human decides. |
 | Stage 2 aborts "non-test files changed" | The agent edited source; the issue gets `agent-failed`. Sharpen the acceptance criteria and retry. |
 | Stage 3 opens a **draft** PR + `agent-failed` | Couldn't reach green within budget; last `pytest` output is in the issue comment. Take over manually or raise `CONTAINER_TIMEOUT`. |
-| Stage 3 aborts "rebase conflict" | The `agent/tests/*` branch no longer applies to base; rebase it by hand or close and re-slice. |
+| Stage 3 aborts "rebase conflict" | Reported with a reason. `conflicts outside tests/` is a real clash with base — rebase by hand or re-slice. `conflict markers left` / `resolution dropped` / `do not collect` mean the agent's own merge of a test-file conflict failed its checks; the branch is untouched, so retry or merge by hand. |
 | Issue stuck in `in-progress` | Stage 3 container died; next `gc` run resets it to `tests-ready` (after `GC_INPROGRESS_HOURS`). |
 | Nothing runs at all | Check `AGENTIC_DISABLED`, `crontab -l` for the `agentic` user, and the `docker` group membership. |
 | Daily cap hit early | `runs/<stage>/<date>.jsonl` already has `MAX_PER_DAY` lines (manual + cron share the budget). Raise `MAX_PER_DAY` or wait for tomorrow. |
