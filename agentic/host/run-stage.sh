@@ -26,8 +26,14 @@ RUNS_DIR="${AGENTIC_RUNS_DIR:-/var/lib/agentic-dev/runs}"
 # AGENT_BACKEND=grok`, which also picks the matching AGENTIC_IMAGE) must win over
 # the env file — otherwise the backend could disagree with the image being run.
 backend_override="${AGENT_BACKEND:-}"
+# A malformed line -- an unquoted value containing a space is the usual one --
+# makes bash run the tail of it as a command, and set -e then kills us with that
+# command's exit status and nothing pointing back at the config file. Say it.
+env_loaded=0
+trap '(( env_loaded )) || echo "run-stage: failed to load $ENV_FILE (see the error above; a value containing spaces must be quoted)" >&2' EXIT
 set -a; # shellcheck disable=SC1090
 source "$ENV_FILE"; set +a
+env_loaded=1; trap - EXIT
 if [[ -n "$backend_override" ]]; then AGENT_BACKEND="$backend_override"; fi
 
 : "${REPO:?set REPO in $ENV_FILE}"
@@ -53,6 +59,15 @@ if [[ "${AGENTIC_DISABLED:-0}" == "1" ]]; then
 fi
 mkdir -p "$RUNS_DIR"
 
+# Fail once, clearly, on a tag that was never built. Without this docker treats
+# the miss as a registry pull and every unit of work dies on the same opaque
+# "pull access denied" -- which reads like a credentials problem rather than the
+# missing `make build-<backend>` it actually is.
+docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+  echo "run-stage: image $IMAGE not built locally (try: make build-$AGENT_BACKEND)" >&2
+  exit 1
+}
+
 # ---- container invocation --------------------------------------------------
 docker_run() { # docker_run <entrypoint-script> [extra docker args...]
   local entry="$1"; shift
@@ -65,7 +80,7 @@ docker_run() { # docker_run <entrypoint-script> [extra docker args...]
   # (~/.claude for the claude backend, ~/.grok for grok):
   #   --read-only --tmpfs /tmp --tmpfs /work --tmpfs /home/agent
   echo "   docker logs -f $name"
-  docker run --rm \
+  docker run --rm --pull=never \
     --name "$name" \
     --log-opt max-size=50m --log-opt max-file=3 \
     --network "${AGENTIC_NET:-bridge}" \

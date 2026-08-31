@@ -57,15 +57,81 @@ workdir="$(clone_repo)"; cd "$workdir"
 base="$(default_branch)"
 git rev-parse --verify "origin/$tests_branch" >/dev/null 2>&1 || die "missing tests branch $tests_branch"
 
+# Hand the branch back to a human and stop. Used when the conflict is a real
+# disagreement about the change rather than scaffolding the pipeline duplicated.
+rebase_dead_end() { # rebase_dead_end <reason>
+  git rebase --abort >/dev/null 2>&1 || true
+  gh issue edit "$ISSUE" --repo "$REPO" --remove-label tests-ready --add-label agent-failed
+  gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 3 aborted** — \`$tests_branch\` does not rebase cleanly onto \`$base\` ($1). A human needs to resolve conflicts."
+  jlog "$STAGE" "\"issue\":$ISSUE,\"status\":\"rebase-conflict\",\"reason\":\"$1\""
+  die "rebase conflict: $1"
+}
+
 phase rebase
 git checkout -b "$impl_branch" "origin/$tests_branch"
+rebase_note=""
 if ! git rebase "origin/$base"; then
-  git rebase --abort || true
-  gh issue edit "$ISSUE" --repo "$REPO" --remove-label tests-ready --add-label agent-failed
-  gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 3 aborted** — \`$tests_branch\` does not rebase cleanly onto \`$base\`. A human needs to resolve conflicts."
-  jlog "$STAGE" "\"issue\":$ISSUE,\"status\":\"rebase-conflict\""
-  die "rebase conflict"
+  # Stage 2 branches are each cut from main at their own time and each writes its
+  # own test scaffolding, so the first one merged leaves every other open branch
+  # with an add/add conflict on tests/conftest.py. That conflict is the
+  # pipeline's own doing and it dead-ends a run that has nothing wrong with it —
+  # and merging two sets of fixtures is exactly what the agent already in this
+  # container is for. A conflict in application code is a real disagreement about
+  # the change, so that one still goes to a human untouched.
+  mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+  (( ${#conflicts[@]} > 0 )) || rebase_dead_end "rebase stopped with no conflicted paths"
+  if printf '%s\n' "${conflicts[@]}" | grep -qvE '^(tests/|conftest\.py$)'; then
+    rebase_dead_end "conflicts outside tests/: ${conflicts[*]}"
+  fi
+
+  phase rebase-resolve
+  log "$STAGE" "test-only rebase conflict, merging with the agent: ${conflicts[*]}"
+  run_agent "Rebasing this issue's test branch onto '$base' stopped with conflicts
+in test files that both sides added independently:
+
+${conflicts[*]}
+
+EDIT each of those files in place and WRITE the merged content back to disk.
+Reading them is not the task; the file on disk must end up merged:
+- Keep every fixture, helper and test from each side. Rename only on a genuine
+  name collision, and update whatever referenced the name you changed.
+- No conflict marker (<<<<<<<, =======, >>>>>>>) may remain in the file.
+- Do not delete tests, and do not touch application code.
+- Check your work by re-reading the file and running 'pytest --collect-only -q';
+  iterate until it collects.
+Do not run any git command — the pipeline stages your files and finishes the
+rebase itself." --max-turns 30
+
+  # The agent is not taken at its word: markers gone, rebase actually finished,
+  # suite still collectable. Any of those failing is the human hand-off again.
+  for f in "${conflicts[@]}"; do
+    [[ -f "$f" ]] || continue
+    grep -qE '^(<<<<<<<|>>>>>>>) ' "$f" && rebase_dead_end "conflict markers left in $f"
+  done
+  git add -- "${conflicts[@]}"
+  if [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; then
+    GIT_EDITOR=true git rebase --continue || rebase_dead_end "could not finish the rebase after resolution"
+  fi
+  # "Resolving" by dropping one side is the cheap way out, so it is the one
+  # checked mechanically: every test file either side had must still be there.
+  mapfile -t want < <( { git ls-tree -r --name-only "origin/$tests_branch" -- tests/ conftest.py
+                         git ls-tree -r --name-only "origin/$base"         -- tests/ conftest.py; } | sort -u )
+  for f in ${want[@]+"${want[@]}"}; do
+    [[ -e "$f" ]] || rebase_dead_end "resolution dropped $f"
+  done
+  pytest --collect-only -q >"$RUN_DIR/rebase-collect.log" 2>&1 \
+    || rebase_dead_end "the merged tests do not collect (see rebase-collect.log)"
+
+  rebase_note="Rebase onto \`$base\` conflicted in \`${conflicts[*]}\` (both branches added them); the agent merged both sides and the suite still collects."
+  log "$STAGE" "rebase conflict resolved in ${conflicts[*]}"
+  jlog "$STAGE" "\"issue\":$ISSUE,\"status\":\"rebase-resolved\",\"files\":\"${conflicts[*]}\""
 fi
+
+# The tests as they landed on $base. Every later "did the agent touch the tests?"
+# question is asked against this, not against origin/$tests_branch: that branch
+# forks at an older commit, so a three-dot diff against it reports main's own
+# test changes (and any conflict resolution above) as if the agent had made them.
+tests_head="$(git rev-parse HEAD)"
 
 gh issue edit "$ISSUE" --repo "$REPO" --remove-label tests-ready --add-label in-progress
 LABEL_HELD=1
@@ -114,7 +180,7 @@ fi
 
 # tests must be untouched vs the Stage 2 branch unless the agent justified edits
 phase gate-tests-untouched
-test_delta="$(git diff "origin/$tests_branch...HEAD" -- tests/ conftest.py | wc -l)"
+test_delta="$(git diff "$tests_head" -- tests/ conftest.py | wc -l)"
 justified="$(jq -r '.test_edits | length' .agent/impl.json 2>/dev/null || echo 0)"
 if (( test_delta > 0 && justified == 0 )); then
   gate_ok=0
@@ -148,6 +214,10 @@ ${files:-_none reported_}
 ## Verification
 - \`pytest\` green; ruff / black / mypy clean.
 - Test files unchanged from Stage 2 (or changes justified above).
+${rebase_note:+
+## Rebase
+$rebase_note
+}
 
 <!-- agent-pipeline: stage3 -->
 _Opened by agentic-dev. Human review required — no auto-merge._" \

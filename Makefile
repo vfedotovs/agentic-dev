@@ -5,7 +5,12 @@
 # One image per agent backend. AGENT_BACKEND picks which one the run targets
 # use; CLAUDE_IMAGE is also tagged agentic-dev:latest so cron installs that
 # still reference the old tag keep working untouched.
-AGENT_BACKEND       ?= claude
+#
+# The backend defaults to whatever the env file says, so `make` and cron agree
+# on one host without having to be told twice; 'claude' is the fallback when the
+# env file is unreadable or silent. A command-line or environment value still
+# wins, e.g. `make implement AGENT_BACKEND=grok`.
+AGENT_BACKEND       ?= $(or $(shell sh -c '. $(ENV_FILE) 2>/dev/null && echo $$AGENT_BACKEND'),claude)
 CLAUDE_IMAGE        ?= agentic-dev:claude-latest
 GROK_IMAGE          ?= agentic-dev:grok-latest
 LEGACY_IMAGE        ?= agentic-dev:latest
