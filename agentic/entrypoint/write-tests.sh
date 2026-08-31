@@ -52,6 +52,13 @@ is correctly implemented. Cover every acceptance criterion. You MAY add fixtures
 helpers, and conftest.py entries. You MUST NOT modify any application/source
 file — tests and conftest.py only.
 
+Keep your fixtures in the test module you add. Every other open issue is being
+worked on its own branch cut from the same commit, and tests/conftest.py is the
+one file all of them share: a whole conftest.py written here collides with
+theirs the moment one of the branches merges. Touch tests/conftest.py only for
+something that genuinely has to be shared across modules, append rather than
+rewrite, and name what you add after this issue.
+
 The new tests MUST FAIL now, and fail for the RIGHT reason (assertion failure or
 a deliberate 'not implemented' — never a collection or import error). Fix any
 scaffolding problems until each new test fails cleanly.
