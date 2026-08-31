@@ -95,9 +95,15 @@ When green, write .agent/impl.json with keys:
   --max-turns 120
 
 # --- acceptance gate --------------------------------------------------------
+# The gate used to run silently too: `pytest -q` prints nothing until it is
+# finished, so a hanging suite added yet more unexplained quiet. Tee'd to the run
+# dir, and PYTEST_TIMEOUT (pytest-timeout, installed in the image) makes a stuck
+# test fail loudly instead of eating the container's remaining budget.
 phase gate-pytest
 gate_ok=1
-pytest -q                                   || gate_ok=0
+PYTEST_TIMEOUT="${PYTEST_TIMEOUT:-300}" pytest -q --color=no 2>&1 \
+  | tee "$RUN_DIR/pytest.log" || gate_ok=0
+log "$STAGE" "gate pytest: $(tail -n 1 "$RUN_DIR/pytest.log" 2>/dev/null || echo 'no output')"
 
 phase gate-lint
 if command -v ruff  >/dev/null; then ruff check .      || gate_ok=0; fi
@@ -177,7 +183,7 @@ for a human to take over.
 
 Last test output:
 \`\`\`
-$(pytest -q 2>&1 | tail -n 40)
+$(tail -n 40 "$RUN_DIR/pytest.log" 2>/dev/null || echo '(no pytest output captured)')
 \`\`\`"
   jlog "$STAGE" "\"issue\":$ISSUE,\"branch\":\"$impl_branch\",\"pr\":\"$pr_url\",\"status\":\"failed\""
   die "acceptance gate failed for #$ISSUE"

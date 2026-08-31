@@ -7,6 +7,9 @@ Reads the stream on stdin and does three things with it:
     detail survives for post-mortem even though stderr only gets a summary;
   * writes RUN_DIR/agent-state after each event (turns, events, last-event
     timestamp) for the heartbeat in common.sh to read;
+  * watches for the same tool call repeating and flags it as a suspected loop,
+    which is the case --max-turns and the wallclock cap only ever catch after
+    the whole budget has already been spent;
   * prints a compact, truncated line per event to stderr, which is what shows up
     in `docker logs -f`.
 
@@ -20,7 +23,9 @@ be the reason a run fails.
 Nothing here may raise. A traceback would close the pipe and hand the agent a
 SIGPIPE, turning an observability tool into the cause of a failed run.
 """
+import collections
 import datetime
+import hashlib
 import json
 import os
 import sys
@@ -33,6 +38,22 @@ MAXLEN = int(os.environ.get("AGENT_LOG_LINE_MAX", "200") or 200)
 STATE = os.path.join(RUN_DIR, "agent-state")
 RAW = os.path.join(RUN_DIR, "agent-stream.jsonl")
 RESULT = os.path.join(RUN_DIR, "agent-result.json")
+LOOP = os.path.join(RUN_DIR, "loop-suspect.json")
+
+
+def _int_env(name, default):
+    try:
+        return max(1, int(os.environ.get(name) or default))
+    except ValueError:
+        return default
+
+
+# An agent stuck re-running one failing command looks, to --max-turns and to the
+# wallclock cap, exactly like an agent making progress -- both only fire once the
+# budget is gone. Identical tool calls repeating inside a short window is the
+# shape that distinguishes the two, and it is visible early.
+LOOP_WINDOW = _int_env("LOOP_WINDOW", 20)
+LOOP_REPEAT_LIMIT = _int_env("LOOP_REPEAT_LIMIT", 5)
 
 # The field worth showing for a tool call, most specific first: one of these
 # says what the agent is actually touching, which is the whole point of the line.
@@ -116,9 +137,46 @@ def describe(event):
     return "event type=%s" % etype, False
 
 
+def tool_signature(block):
+    """(signature, human label) for one tool_use block."""
+    name = str(block.get("name", "?"))
+    inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+    try:
+        canonical = json.dumps(inp, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        canonical = repr(inp)
+    hint = next((f for f in HINTS if inp.get(f)), None)
+    label = "%s%s" % (name, " %s=%s" % (hint, clip(inp[hint], 80)) if hint else "")
+    return name + ":" + hashlib.sha1(canonical.encode("utf-8", "replace")).hexdigest(), label
+
+
 def main():
     raw = open(RAW, "a", buffering=1)
     turns = events = 0
+    window = collections.deque(maxlen=LOOP_WINDOW)
+    reported = set()
+
+    def check_loop(event):
+        """Flag a tool call that keeps repeating. Reports each signature once."""
+        for block in blocks_of(event):
+            if block.get("type") != "tool_use":
+                continue
+            sig, label = tool_signature(block)
+            window.append(sig)
+            repeats = list(window).count(sig)
+            if repeats < LOOP_REPEAT_LIMIT or sig in reported:
+                continue
+            reported.add(sig)
+            emit("LOOP-SUSPECT tool=%s repeats=%d/%d -- the same call keeps coming back"
+                 % (label, repeats, len(window)))
+            try:
+                with open(LOOP, "w") as fh:
+                    json.dump({"tool": block.get("name"), "label": label,
+                               "repeats": repeats, "window": len(window),
+                               "limit": LOOP_REPEAT_LIMIT,
+                               "at_event": events, "ts": int(time.time())}, fh)
+            except OSError:
+                pass
 
     def save_state():
         # Written whole each time: the heartbeat only ever reads the last value,
@@ -164,6 +222,10 @@ def main():
             summary, is_turn = "unparsed event (%s)" % type(exc).__name__, False
         if is_turn:
             turns += 1
+            try:
+                check_loop(event)
+            except Exception:                          # noqa: BLE001 - never fatal
+                pass
         if summary:
             emit("turn=%d %s" % (turns, summary) if is_turn else summary)
         save_state()

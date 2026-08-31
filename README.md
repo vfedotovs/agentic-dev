@@ -197,6 +197,10 @@ Every run writes the phase it is currently in to a one-line file, so a container
 that has gone quiet can be diagnosed from the host without attaching to it:
 
 ```bash
+# which containers are running, and what is each one doing?
+make ps
+# agentic-implement-57-1788178268  4 minutes ago  gate-pytest   docker logs -f agentic-implement-57-1788178268
+
 # what is every run today doing right now?
 make phase
 # write-tests  42     agent            last change 734s ago
@@ -283,6 +287,53 @@ Both backends are covered by one filter: Claude Code's `--output-format
 stream-json` and Grok's `--output-format streaming-messages-json` frame their
 events the same way. Anything unrecognised is still counted, stored and printed
 generically — the filter is written so it can never be the reason a run fails.
+
+### Catching a loop early
+
+An agent stuck re-running one failing command looks, to `--max-turns` and to the
+wallclock cap, exactly like an agent making progress: both only fire once the
+budget is gone. What distinguishes the two is the *same* tool call coming back,
+and that is visible almost immediately:
+
+```
+… [implement] LOOP-SUSPECT tool=Bash command=pytest -q tests/test_parser.py repeats=5/5 -- the same call keeps coming back
+… [implement] hb elapsed=6s phase=agent turns=6 events=6 quiet=1s rss=13M -- LOOP-SUSPECT: Bash command=pytest -q tests/test_parser.py x5
+```
+
+Calls are matched on the tool name plus a hash of its arguments, over a rolling
+window of the last `LOOP_WINDOW` calls, so an agent editing a different file each
+turn is never flagged — only one that keeps making the identical call.
+
+It is **report-only by default**. The flag lands in the log, in
+`<run-dir>/loop-suspect.json`, and in the run's ledger line
+(`"loop_suspect":{"tool":"Bash","repeats":5,"aborted":0}`), so you can see how
+often it fires on your own traffic before letting it act. Set `LOOP_ABORT=1` and
+it stops the agent instead:
+
+```
+… [implement] LOOP-ABORT stopping the agent (LOOP_ABORT=1): Bash command=pytest -q tests/test_parser.py x5
+… [implement] EXIT rc=143 status=loop-abort died_in=agent elapsed=6s
+```
+
+The run then ends as `loop-abort` rather than riding out the full
+`CONTAINER_TIMEOUT`, and Stage 3 releases its `in-progress` claim on the way out
+as it does for any other early exit.
+
+### The acceptance gate
+
+Stage 3's gate used to run `pytest -q` silently, so a hanging suite added yet
+more unexplained quiet on top of the agent's. It now streams, is tee'd to
+`<run-dir>/pytest.log`, and honours `PYTEST_TIMEOUT` (via `pytest-timeout`, in
+the image) so a stuck test fails loudly instead of eating whatever wallclock
+budget the container has left:
+
+```
+FAILED tests/test_hang.py::test_hangs_forever - Failed: Timeout (>300.0s) from ...
+… [implement] gate pytest: 1 failed, 1 passed in 300.4s
+```
+
+The failure comment posted to the issue is taken from that same log rather than
+from a second `pytest` run, so it reports what actually happened.
 
 ### Run a stage now (outside cron)
 

@@ -28,7 +28,7 @@ REPO     ?= $(shell sh -c '. $(ENV_FILE) 2>/dev/null && echo $$REPO')
 .PHONY: help build build-claude build-grok build-all \
         rebuild rebuild-claude rebuild-grok rebuild-all lint parse \
         slice slice-dry write-tests implement gc gc-apply run-issue \
-        status logs phase watch labels install-cron uninstall-cron pause resume clean
+        status logs ps phase watch labels install-cron uninstall-cron pause resume clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -117,6 +117,17 @@ status: ## Show pipeline state from GitHub (needs REPO or a readable ENV_FILE)
 
 logs: ## Tail the stage logs
 	tail -n 40 -F $(LOG_DIR)/*.log
+
+ps: ## Show running agentic containers, with the phase each one is in
+	@docker ps --filter 'name=^agentic-' --format '{{.Names}}\t{{.RunningFor}}' \
+	  | while IFS="$$(printf '\t')" read -r name age; do \
+	      stage=$$(echo "$$name" | sed -E 's/^agentic-(.*)-[^-]+-[0-9]+$$/\1/'); \
+	      issue=$$(echo "$$name" | sed -E 's/^agentic-.*-([^-]+)-[0-9]+$$/\1/'); \
+	      p="$(RUNS_DIR)/$$stage/$$(date +%F)/$$issue/phase"; \
+	      printf '%-34s %-14s %-16s %s\n' "$$name" "$$age" \
+	        "$$([ -r "$$p" ] && cat "$$p" || echo '-')" "docker logs -f $$name"; \
+	    done; \
+	  docker ps -q --filter 'name=^agentic-' | grep -q . || echo "no agentic containers running"
 
 phase: ## Show what every run today is doing right now (STAGE=... to filter one)
 	@d=$(RUNS_DIR); today=$$(date +%F); found=0; \

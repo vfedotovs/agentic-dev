@@ -56,10 +56,18 @@ mkdir -p "$RUNS_DIR"
 # ---- container invocation --------------------------------------------------
 docker_run() { # docker_run <entrypoint-script> [extra docker args...]
   local entry="$1"; shift
+  # A predictable name so `docker logs -f` is copy-paste rather than an ID hunt.
+  # The epoch suffix keeps a retry of the same issue from colliding with a
+  # container the daemon has not finished removing yet.
+  local name
+  name="agentic-${STAGE}-${ISSUE_LABEL:-run}-$(date +%s)"
   # Hardening you can add once verified against the agent CLI's state dir
   # (~/.claude for the claude backend, ~/.grok for grok):
   #   --read-only --tmpfs /tmp --tmpfs /work --tmpfs /home/agent
+  echo "   docker logs -f $name"
   docker run --rm \
+    --name "$name" \
+    --log-opt max-size=50m --log-opt max-file=3 \
     --network "${AGENTIC_NET:-bridge}" \
     --memory "${AGENTIC_MEM:-4g}" --cpus "${AGENTIC_CPUS:-2}" --pids-limit 512 \
     --stop-timeout "$CONTAINER_TIMEOUT" \
@@ -68,6 +76,7 @@ docker_run() { # docker_run <entrypoint-script> [extra docker args...]
     -e AGENT_BACKEND -e ANTHROPIC_API_KEY -e XAI_API_KEY -e GROK_MODEL \
     -e MAX_PER_DAY -e CONTAINER_TIMEOUT -e RUNS_DIR=/runs \
     -e HEARTBEAT_SECS -e AGENT_STALL_SECS -e AGENT_LOG_LINE_MAX \
+    -e LOOP_WINDOW -e LOOP_REPEAT_LIMIT -e LOOP_ABORT -e PYTEST_TIMEOUT \
     -e AGENT_MAX_TURNS -e CLAUDE_MAX_TURNS -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL \
     -v "$RUNS_DIR:/runs" \
     "$@" \
@@ -116,10 +125,19 @@ run_batch() { # run_batch <stage> <entrypoint> <ready-label> [type-labels]
     echo "$stage: no eligible issues"; return 0
   fi
   echo "$stage: processing ${#nums[@]} issue(s): ${nums[*]}"
-  local n
+  local n rc
   for n in "${nums[@]}"; do
     echo ">> $stage #$n"
-    docker_run "$entry" -e ISSUE="$n" || echo "!! $stage #$n exited non-zero"
+    rc=0
+    ISSUE_LABEL="$n" docker_run "$entry" -e ISSUE="$n" || rc=$?
+    # 137/143 mean the container was killed rather than failing a check, which is
+    # a different problem with a different fix -- keep them distinguishable.
+    case "$rc" in
+      0)       ;;
+      124|137) echo "!! $stage #$n killed at the wallclock cap (exit $rc)" ;;
+      143)     echo "!! $stage #$n terminated (exit $rc)" ;;
+      *)       echo "!! $stage #$n exited $rc" ;;
+    esac
   done
 }
 

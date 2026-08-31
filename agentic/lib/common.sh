@@ -61,7 +61,16 @@ AGENTIC_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEARTBEAT_SECS="${HEARTBEAT_SECS:-30}"
 AGENT_STALL_SECS="${AGENT_STALL_SECS:-300}"
 AGENT_LOG_LINE_MAX="${AGENT_LOG_LINE_MAX:-200}"
-export AGENT_LOG_LINE_MAX
+
+# Loop detection. The stream filter raises the flag; LOOP_ABORT decides whether
+# anything is done about it. It defaults to 0 (report only) on purpose: killing a
+# run on a heuristic is worth doing only once the flag has been seen to be right
+# on this repo's own traffic. The evidence lands in RUN_DIR/loop-suspect.json
+# either way.
+LOOP_WINDOW="${LOOP_WINDOW:-20}"
+LOOP_REPEAT_LIMIT="${LOOP_REPEAT_LIMIT:-5}"
+LOOP_ABORT="${LOOP_ABORT:-0}"
+export AGENT_LOG_LINE_MAX LOOP_WINDOW LOOP_REPEAT_LIMIT
 
 RUN_ID="$(date +%s)-$$"
 RUN_DIR="$RUNS_DIR/${STAGE:-entrypoint}/$(date +%F)/${ISSUE:-run}"
@@ -116,6 +125,24 @@ container_rss() {
   fi
 }
 
+# Stop an agent the filter has flagged as looping. The pid comes from a file
+# because the heartbeat runs in a subshell forked before budget_guard sets
+# BUDGET_GUARD_PID, so it cannot see that variable. SIGTERM to `timeout` is
+# propagated to the agent underneath it.
+loop_abort_check() {
+  [[ "$LOOP_ABORT" == "1" && -r "$RUN_DIR/loop-suspect.json" ]] || return 0
+  local pid=''
+  [[ -r "$RUN_DIR/agent.pid" ]] && read -r pid < "$RUN_DIR/agent.pid"
+  [[ -n "$pid" ]] || return 0
+  log "${STAGE:-entrypoint}" "LOOP-ABORT stopping the agent (LOOP_ABORT=1): $(loop_suspect_label)"
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+loop_suspect_label() {
+  [[ -r "$RUN_DIR/loop-suspect.json" ]] || return 0
+  jq -r '"\(.label) x\(.repeats)"' "$RUN_DIR/loop-suspect.json" 2>/dev/null || true
+}
+
 heartbeat_tick() {
   local turns=0 events=0 last=0 quiet=-1 tag=hb note='' now
   now="$(date +%s)"
@@ -137,7 +164,10 @@ heartbeat_tick() {
     note="$note -- past 80% of the ${CONTAINER_TIMEOUT:-1200}s budget"
   fi
 
+  [[ -r "$RUN_DIR/loop-suspect.json" ]] && note="$note -- LOOP-SUSPECT: $(loop_suspect_label)"
+
   log "${STAGE:-entrypoint}" "$tag elapsed=${SECONDS}s phase=$PHASE turns=${turns:-0} events=${events:-0} quiet=$(( quiet < 0 ? 0 : quiet ))s rss=$(container_rss)$note"
+  loop_abort_check
 }
 
 heartbeat_start() {
@@ -175,6 +205,10 @@ on_exit() {
   trap - EXIT
   heartbeat_stop
   local status; status="$(exit_status "$rc")"
+  # A loop-abort arrives as an ordinary SIGTERM; name it for what it was.
+  if (( rc != 0 )) && [[ "$LOOP_ABORT" == "1" && -r "$RUN_DIR/loop-suspect.json" ]]; then
+    status=loop-abort
+  fi
   printf 'exit:%s\n' "$status" > "$RUN_DIR/phase"
   printf '{"ts":"%s","run":"%s","stage":"%s","phase":"exit","died_in":"%s","elapsed":%d,"exit":%d,"status":"%s"}\n' \
     "$(date -Iseconds)" "$RUN_ID" "${STAGE:-entrypoint}" "$PHASE" "$SECONDS" "$rc" "$status" \
@@ -226,8 +260,12 @@ budget_guard() {
   local rc=0
   timeout --signal=SIGKILL "${CONTAINER_TIMEOUT:-1200}" "$@" &
   BUDGET_GUARD_PID=$!
+  # The heartbeat subshell was forked before this assignment, so it can only
+  # reach the pid through a file.
+  echo "$BUDGET_GUARD_PID" > "$RUN_DIR/agent.pid" 2>/dev/null || true
   wait "$BUDGET_GUARD_PID" || rc=$?
   BUDGET_GUARD_PID=
+  rm -f "$RUN_DIR/agent.pid" 2>/dev/null || true
   return "$rc"
 }
 
@@ -317,9 +355,9 @@ run_agent() { # run_agent <prompt> [extra agent args...]
   # child of this shell, its rc is read straight off it, and the filter is still
   # `wait`ed on so the last events are never lost to a race at exit.
   local fifo_dir fifo filter_pid rc=0
-  # Stale result from an earlier call would otherwise be reported as this call's
-  # cost -- Stage 1 invokes run_agent once per plan item into the same RUN_DIR.
-  rm -f "$RUN_DIR/agent-result.json"
+  # Stale artefacts from an earlier call would otherwise be attributed to this
+  # one -- Stage 1 invokes run_agent once per plan item into the same RUN_DIR.
+  rm -f "$RUN_DIR/agent-result.json" "$RUN_DIR/loop-suspect.json"
   fifo_dir="$(mktemp -d)"; fifo="$fifo_dir/agent.out"
   mkfifo "$fifo"
   RUN_DIR="$RUN_DIR" STAGE="${STAGE:-agent}" \
@@ -349,6 +387,12 @@ agent_usage_human() {
     "$RUN_DIR/agent-result.json" 2>/dev/null || true
 }
 
+agent_loop_fields() {
+  [[ -r "$RUN_DIR/loop-suspect.json" ]] || return 0
+  jq -rc '",\"loop_suspect\":{\"tool\":\(.tool|tojson),\"repeats\":\(.repeats),\"aborted\":'"${LOOP_ABORT:-0}"'}"' \
+    "$RUN_DIR/loop-suspect.json" 2>/dev/null || true
+}
+
 agent_usage_fields() {
   [[ -r "$RUN_DIR/agent-result.json" ]] || return 0
   jq -rc '",\"cost_usd\":\(.total_cost_usd // 0),\"agent_turns\":\(.num_turns // 0),\"tokens_in\":\(.usage.input_tokens // 0),\"tokens_out\":\(.usage.output_tokens // 0)"' \
@@ -361,8 +405,8 @@ agent_usage_fields() {
 jlog() { # jlog <stage> <json-object-without-braces>
   local stage="$1"; shift
   mkdir -p "$RUNS_DIR/$stage"
-  printf '{"ts":"%s","run":"%s","stage":"%s",%s%s}\n' \
-    "$(date -Iseconds)" "$RUN_ID" "$stage" "$*" "$(agent_usage_fields)" \
+  printf '{"ts":"%s","run":"%s","stage":"%s",%s%s%s}\n' \
+    "$(date -Iseconds)" "$RUN_ID" "$stage" "$*" "$(agent_usage_fields)" "$(agent_loop_fields)" \
     >> "$RUNS_DIR/$stage/$(date +%F).jsonl"
   JLOG_WRITTEN=1
 }
