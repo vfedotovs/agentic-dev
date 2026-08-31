@@ -63,6 +63,7 @@ delete_branch() { # delete_branch <name> <reason>
 #         open + inactive > STALE_DAYS -> comment, close, delete branch,
 #         reset the linked issue to needs-tests + agent-stale for a human.
 # ---------------------------------------------------------------------------
+phase scan-prs
 gh pr list --repo "$REPO" --state all --limit 500 \
    --json number,state,headRefName,updatedAt,url \
    --jq '.[] | [.number, .state, .headRefName, .updatedAt, .url] | @tsv' \
@@ -100,6 +101,7 @@ gh pr list --repo "$REPO" --state all --limit 500 \
 # 2. Orphan agent branches: no PR (any state), and either already contained in
 #    base, or tip older than STALE_DAYS.
 # ---------------------------------------------------------------------------
+phase scan-branches
 gh api --paginate "repos/$REPO/branches?per_page=100" --jq '.[].name' \
 | while read -r b; do
     is_agent_branch "$b" || continue
@@ -119,6 +121,7 @@ gh api --paginate "repos/$REPO/branches?per_page=100" --jq '.[].name' \
 # ---------------------------------------------------------------------------
 # 3. Issues stuck in 'in-progress' with no open PR -> back to tests-ready.
 # ---------------------------------------------------------------------------
+phase scan-inprogress
 gh issue list --repo "$REPO" --state open --label in-progress --limit 200 \
    --json number,updatedAt --jq '.[] | [.number, .updatedAt] | @tsv' \
 | while IFS=$'\t' read -r num updated; do
@@ -134,6 +137,7 @@ gh issue list --repo "$REPO" --state open --label in-progress --limit 200 \
     fi
   done
 
+phase 'done'
 if [[ "$DRY_RUN" == "1" ]]; then
   log "$STAGE" "done — DRY RUN, see WOULD lines above. Set GC_DRY_RUN=0 to act."
 else

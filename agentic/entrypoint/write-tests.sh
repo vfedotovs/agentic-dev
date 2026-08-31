@@ -22,6 +22,7 @@ require_agent_env
 
 quota_reached "$STAGE" && die "daily quota (${MAX_PER_DAY:-10}) already reached"
 
+phase issue-fetch
 meta="$(gh issue view "$ISSUE" --repo "$REPO" --json number,title,body,labels)"
 labels="$(jq -r '.labels[].name' <<<"$meta")"
 grep -qxE 'feature|bug|refactor'  <<<"$labels" || die "#$ISSUE is not feature/bug/refactor"
@@ -32,6 +33,7 @@ title="$(jq -r .title <<<"$meta")"
 slug="$(tr '[:upper:]' '[:lower:]' <<<"$title" | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40)"
 branch="agent/tests/${ISSUE}-${slug}"
 
+phase clone
 workdir="$(clone_repo)"; cd "$workdir"
 base="$(default_branch)"
 git checkout -b "$branch" "origin/$base"
@@ -39,6 +41,10 @@ git checkout -b "$branch" "origin/$base"
 mkdir -p .agent
 jq -r .body <<<"$meta" > .agent/issue.md
 
+# The agent phase is the long one and, until its output is streamed, the silent
+# one. `cat $RUN_DIR/phase` reading "agent" is what distinguishes a run that is
+# thinking from one wedged on a clone or a `gh` call.
+phase agent
 run_agent "Read .agent/issue.md — a GitHub issue for this Python project.
 
 Write pytest tests (under tests/) that will pass ONLY once the described change
@@ -57,6 +63,7 @@ When done, write .agent/report.json with keys:
   --max-turns 60
 
 # --- guard: only tests/ and conftest.py may change -----------------------------
+phase diff-guard
 changed="$( { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u )"
 offending="$(grep -vE '^(tests/|conftest\.py$)' <<<"$changed" || true)"
 if [[ -n "$offending" ]]; then
@@ -69,11 +76,13 @@ $offending
   die "non-test files changed"
 fi
 
+phase report-check
 [[ -f .agent/report.json ]] || die "agent produced no report.json"
 mapfile -t nodes < <(jq -r '.new_tests[]' .agent/report.json)
 (( ${#nodes[@]} > 0 )) || die "report.json lists no new tests"
 
 # --- guard: the new tests must actually be red -------------------------------
+phase pytest-red
 if pytest -q "${nodes[@]}"; then
   gh issue edit "$ISSUE" --repo "$REPO" --add-label needs-triage
   gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 2 needs triage** — the new tests already PASS, so the behaviour may already exist. A human should confirm before implementation."
@@ -81,12 +90,16 @@ if pytest -q "${nodes[@]}"; then
   die "new tests pass unexpectedly"
 fi
 
+phase commit
 git add -A
 git commit -m "test: add failing tests for #${ISSUE}
 
 Refs #${ISSUE}"
+
+phase push
 git push -u origin "$branch"
 
+phase gh-report
 failures="$(jq -r '.failures[] | "- `\(.node_id)` — \(.message)"' .agent/report.json)"
 gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 2 complete** — failing tests pushed to \`$branch\`:
 

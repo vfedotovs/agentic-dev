@@ -191,6 +191,54 @@ gh pr list     --repo "$REPO" --label agent-pr-open
 gh issue list  --repo "$REPO" --label agent-failed --state all
 ```
 
+### Diagnose a run that looks stuck
+
+Every run writes the phase it is currently in to a one-line file, so a container
+that has gone quiet can be diagnosed from the host without attaching to it:
+
+```bash
+# what is every run today doing right now?
+make phase
+# write-tests  42     agent            last change 734s ago
+# implement    57     gate-pytest      last change 3s ago
+
+# the full trail for one run, followed live
+make watch STAGE=implement ISSUE=57
+```
+
+The layout under `RUNS_DIR`:
+
+```
+runs/<stage>/<date>.jsonl        ledger — one line per run that reached the agent
+runs/<stage>/<date>/<issue>/
+    phase                        the phase this run is in *now* (or exit:<status>)
+    phases.jsonl                 every phase transition, with seconds spent in each
+```
+
+Reading `phase` answers the question directly:
+
+| `phase` says | meaning |
+|---|---|
+| `clone` / `issue-fetch` / `push` / `gh-report` | blocked on GitHub, not on the agent |
+| `agent` | inside the agent CLI — the phase capped by `CONTAINER_TIMEOUT` (default 1200s = 20 min) |
+| `agent-item-7` (Stage 1) | the slicer is on the 7th plan item |
+| `gate-pytest` | the acceptance gate is running the suite |
+| `exit:timeout` | killed at the wallclock cap; `died_in` in `phases.jsonl` says where |
+| `exit:error` | a guard tripped or a command failed |
+
+`phases.jsonl` records `prev_secs` per transition, so a run that took 18 minutes
+in `agent` and 4 seconds everywhere else is obvious after the fact.
+
+Stage 3 additionally releases its `in-progress` claim on **any** exit — including
+a killed agent — and comments on the issue saying which phase it died in, so a
+dead container no longer leaves an issue claimed until `gc` reclaims it 24 hours
+later.
+
+> Note: while the agent phase is running the agent CLI's own output is still
+> discarded, so `docker logs` stays quiet during it. `phase` is what tells you
+> the run is *in* that phase rather than wedged before it. Streaming the agent's
+> turns and adding a heartbeat is the next change.
+
 ### Run a stage now (outside cron)
 
 ```bash
@@ -201,7 +249,9 @@ sudo -u agentic GC_DRY_RUN=0 /opt/agentic-dev/agentic/host/run-stage.sh gc
 ```
 
 The daily `MAX_PER_DAY` budget is shared with the cron run (counted from
-`runs/<stage>/<date>.jsonl`), so a manual run just consumes part of it.
+`runs/<stage>/<date>.jsonl`), so a manual run just consumes part of it. A run
+that fails *before* the agent starts — a stale label, a missing tests branch —
+costs nothing and so is not counted; it still leaves a phase trail.
 
 ### Debug one issue in a container
 
