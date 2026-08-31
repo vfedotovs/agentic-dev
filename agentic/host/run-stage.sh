@@ -67,6 +67,7 @@ docker_run() { # docker_run <entrypoint-script> [extra docker args...]
     -e REPO -e GH_TOKEN \
     -e AGENT_BACKEND -e ANTHROPIC_API_KEY -e XAI_API_KEY -e GROK_MODEL \
     -e MAX_PER_DAY -e CONTAINER_TIMEOUT -e RUNS_DIR=/runs \
+    -e HEARTBEAT_SECS -e AGENT_STALL_SECS -e AGENT_LOG_LINE_MAX \
     -e AGENT_MAX_TURNS -e CLAUDE_MAX_TURNS -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL \
     -v "$RUNS_DIR:/runs" \
     "$@" \

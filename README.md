@@ -234,10 +234,55 @@ a killed agent — and comments on the issue saying which phase it died in, so a
 dead container no longer leaves an issue claimed until `gc` reclaims it 24 hours
 later.
 
-> Note: while the agent phase is running the agent CLI's own output is still
-> discarded, so `docker logs` stays quiet during it. `phase` is what tells you
-> the run is *in* that phase rather than wedged before it. Streaming the agent's
-> turns and adding a heartbeat is the next change.
+### Watch the agent work
+
+The agent's turns are streamed to the container log, one line each, so
+`docker logs -f` shows what it is doing as it does it:
+
+```
+… [implement] --> agent (2s in clone, 6s total)
+… [implement] init model=claude-opus-5 tools=26
+… [implement] turn=1 tool=Read file_path=src/parser.py
+… [implement] turn=2 tool=Bash command=pytest -q tests/test_parser.py
+… [implement] result=ERR 8 failed, 2 passed in 3.1s
+… [implement] hb elapsed=63s phase=agent turns=2 events=9 quiet=41s rss=612M
+… [implement] turn=3 tool=Edit file_path=src/parser.py
+… [implement] done status=success turns=14 cost=$0.83 tokens=41022/9317 in 184s
+```
+
+The `hb` heartbeat lands every `HEARTBEAT_SECS` regardless of what the agent is
+doing, so a container blocked on a slow tool call or a hanging API request still
+proves it is alive. `quiet` is seconds since the last agent event; once that
+passes `AGENT_STALL_SECS` the line becomes `STALL`, which is the shape a hang or
+a loop takes:
+
+```
+… [implement] STALL elapsed=780s phase=agent turns=41 events=204 quiet=331s rss=1.4G -- no agent event for 331s
+… [implement] hb elapsed=990s phase=agent turns=41 events=204 quiet=541s rss=1.4G -- past 80% of the 1200s budget
+```
+
+That last warning fires at 80% of `CONTAINER_TIMEOUT`, so an impending SIGKILL is
+visible before it lands rather than only inferable afterwards from exit 137.
+
+Each run's full untruncated stream stays on disk at
+`<run-dir>/agent-stream.jsonl`, and the final `result` event at
+`<run-dir>/agent-result.json`. Cost and token totals are spliced into the run's
+ledger line automatically, so spend is queryable per issue:
+
+```bash
+jq -s 'map(select(.cost_usd)) | {runs: length, usd: (map(.cost_usd) | add)}' \
+  /var/lib/agentic-dev/runs/implement/$(date +%F).jsonl
+
+# replay one run's stream through the same summariser (a scratch RUN_DIR, since
+# the filter also re-writes its state/result files wherever you point it)
+RUN_DIR=$(mktemp -d) STAGE=implement python3 agentic/lib/stream_filter.py \
+  < /var/lib/agentic-dev/runs/implement/$(date +%F)/57/agent-stream.jsonl > /dev/null
+```
+
+Both backends are covered by one filter: Claude Code's `--output-format
+stream-json` and Grok's `--output-format streaming-messages-json` frame their
+events the same way. Anything unrecognised is still counted, stored and printed
+generically — the filter is written so it can never be the reason a run fails.
 
 ### Run a stage now (outside cron)
 
