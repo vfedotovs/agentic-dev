@@ -59,6 +59,15 @@ if [[ "${AGENTIC_DISABLED:-0}" == "1" ]]; then
 fi
 mkdir -p "$RUNS_DIR"
 
+# Fail once, clearly, on a tag that was never built. Without this docker treats
+# the miss as a registry pull and every unit of work dies on the same opaque
+# "pull access denied" -- which reads like a credentials problem rather than the
+# missing `make build-<backend>` it actually is.
+docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+  echo "run-stage: image $IMAGE not built locally (try: make build-$AGENT_BACKEND)" >&2
+  exit 1
+}
+
 # ---- container invocation --------------------------------------------------
 docker_run() { # docker_run <entrypoint-script> [extra docker args...]
   local entry="$1"; shift
@@ -71,7 +80,7 @@ docker_run() { # docker_run <entrypoint-script> [extra docker args...]
   # (~/.claude for the claude backend, ~/.grok for grok):
   #   --read-only --tmpfs /tmp --tmpfs /work --tmpfs /home/agent
   echo "   docker logs -f $name"
-  docker run --rm \
+  docker run --rm --pull=never \
     --name "$name" \
     --log-opt max-size=50m --log-opt max-file=3 \
     --network "${AGENTIC_NET:-bridge}" \
