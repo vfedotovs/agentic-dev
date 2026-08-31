@@ -22,13 +22,31 @@ RUNS_DIR="${AGENTIC_RUNS_DIR:-/var/lib/agentic-dev/runs}"
 
 [[ -f "$ENV_FILE" ]] || { echo "run-stage: missing env file $ENV_FILE" >&2; exit 1; }
 
-# An AGENT_BACKEND already in the caller's environment (e.g. `make write-tests
-# AGENT_BACKEND=grok`, which also picks the matching AGENTIC_IMAGE) must win over
-# the env file — otherwise the backend could disagree with the image being run.
-backend_override="${AGENT_BACKEND:-}"
+# Anything the caller passed in must win over the env file. `set -a; source`
+# would otherwise overwrite it with the file's own value, and the two cases that
+# makes dangerous are both dry-run switches:
+#
+#   make slice-dry  sets SLICER_DRY_RUN=1 -> clobbered to 0 -> creates real issues
+#   make gc         sets GC_DRY_RUN=1     -> clobbered to 0 -> actually deletes
+#                                            branches and closes PRs
+#
+# AGENT_BACKEND is in the list for a different reason: `make write-tests
+# AGENT_BACKEND=grok` also picks the matching AGENTIC_IMAGE, so letting the file
+# win would leave the backend disagreeing with the image being run.
+#
+# ${!_v+x} rather than [[ -v ]] so this still works on a bash 3.2 host, and so a
+# deliberately-empty caller value is preserved rather than treated as unset.
+_caller_env=()
+for _v in AGENT_BACKEND SLICER_DRY_RUN GC_DRY_RUN MAX_ISSUES MAX_PER_DAY \
+          AGENTIC_DISABLED CONTAINER_TIMEOUT LOOP_ABORT; do
+  [[ -n "${!_v+x}" ]] && _caller_env+=("$_v=${!_v}")
+done
+
 set -a; # shellcheck disable=SC1090
 source "$ENV_FILE"; set +a
-if [[ -n "$backend_override" ]]; then AGENT_BACKEND="$backend_override"; fi
+
+for _kv in ${_caller_env[@]+"${_caller_env[@]}"}; do export "${_kv?}"; done
+unset _caller_env _v _kv
 
 : "${REPO:?set REPO in $ENV_FILE}"
 : "${GH_TOKEN:?set GH_TOKEN in $ENV_FILE}"
