@@ -52,6 +52,17 @@ RUNS_DIR="${RUNS_DIR:-/runs}"
 # Re-running the same issue on the same day reuses the directory on purpose:
 # `phase` then always reflects the newest attempt. RUN_ID distinguishes the
 # attempts' appended phases.jsonl lines.
+AGENTIC_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# How the agent phase reports itself. Defaults chosen so a healthy run is
+# readable rather than noisy: one line per agent event, plus a heartbeat every
+# HEARTBEAT_SECS that proves the container is alive even when the agent is
+# silent (a long tool call, a slow API).
+HEARTBEAT_SECS="${HEARTBEAT_SECS:-30}"
+AGENT_STALL_SECS="${AGENT_STALL_SECS:-300}"
+AGENT_LOG_LINE_MAX="${AGENT_LOG_LINE_MAX:-200}"
+export AGENT_LOG_LINE_MAX
+
 RUN_ID="$(date +%s)-$$"
 RUN_DIR="$RUNS_DIR/${STAGE:-entrypoint}/$(date +%F)/${ISSUE:-run}"
 mkdir -p "$RUN_DIR" 2>/dev/null || RUN_DIR="$(mktemp -d)"
@@ -82,6 +93,66 @@ exit_status() { # exit_status <rc> — a word for the jsonl "status" field
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
+# Proof-of-life while the agent runs. The stream filter already prints a line per
+# agent event, but a container blocked on a slow tool call or a hanging API
+# request emits no events at all -- and that silence is exactly the case that
+# used to be indistinguishable from a wedged run. The heartbeat is deliberately
+# a separate process from the filter so it keeps ticking even if the agent
+# produces nothing whatsoever.
+HEARTBEAT_PID=
+
+# Whole-container memory. `ps` is not installed in the image, and the cgroup
+# figure is the one that matters anyway: it is what AGENTIC_MEM caps and what an
+# OOM kill (also exit 137) would be triggered by.
+container_rss() {
+  local bytes
+  if [[ -r /sys/fs/cgroup/memory.current ]] && read -r bytes < /sys/fs/cgroup/memory.current; then
+    echo "$(( bytes / 1048576 ))M"
+  else
+    echo '?'
+  fi
+}
+
+heartbeat_tick() {
+  local turns=0 events=0 last=0 quiet=-1 tag=hb note='' now
+  now="$(date +%s)"
+  if [[ -r "$RUN_DIR/agent-state" ]]; then
+    read -r turns events last < <(jq -r '[.turns,.events,.last_ts]|@tsv' \
+      "$RUN_DIR/agent-state" 2>/dev/null) || true
+  fi
+  [[ -n "${last:-}" && "$last" =~ ^[0-9]+$ ]] || last=0
+  (( last > 0 )) && quiet=$(( now - last ))
+
+  # Silence past AGENT_STALL_SECS is the shape a loop or a hang takes.
+  if (( quiet >= AGENT_STALL_SECS )); then
+    tag=STALL
+    note=" -- no agent event for ${quiet}s"
+  fi
+  # Warn before the wallclock cap fires, so an impending SIGKILL is visible in
+  # the log rather than only inferable afterwards from the exit code.
+  if (( SECONDS * 100 >= ${CONTAINER_TIMEOUT:-1200} * 80 )); then
+    note="$note -- past 80% of the ${CONTAINER_TIMEOUT:-1200}s budget"
+  fi
+
+  log "${STAGE:-entrypoint}" "$tag elapsed=${SECONDS}s phase=$PHASE turns=${turns:-0} events=${events:-0} quiet=$(( quiet < 0 ? 0 : quiet ))s rss=$(container_rss)$note"
+}
+
+heartbeat_start() {
+  heartbeat_stop
+  ( while :; do sleep "$HEARTBEAT_SECS"; heartbeat_tick; done ) &
+  HEARTBEAT_PID=$!
+}
+
+heartbeat_stop() {
+  [[ -n "$HEARTBEAT_PID" ]] || return 0
+  kill "$HEARTBEAT_PID" 2>/dev/null || true
+  wait "$HEARTBEAT_PID" 2>/dev/null || true
+  HEARTBEAT_PID=
+}
+
 # Set by jlog(). The exit trap adds a ledger line only when the stage did not
 # already write one, so the ledger keeps exactly one line per run that reached
 # the agent — whether it succeeded, tripped a guard, or was killed mid-agent.
@@ -102,6 +173,7 @@ on_exit() {
   local rc=$?
   set +e
   trap - EXIT
+  heartbeat_stop
   local status; status="$(exit_status "$rc")"
   printf 'exit:%s\n' "$status" > "$RUN_DIR/phase"
   printf '{"ts":"%s","run":"%s","stage":"%s","phase":"exit","died_in":"%s","elapsed":%d,"exit":%d,"status":"%s"}\n' \
@@ -130,6 +202,7 @@ on_signal() { # on_signal <exit-code> <signal-name>
   if [[ -n "$BUDGET_GUARD_PID" ]]; then
     kill -TERM "$BUDGET_GUARD_PID" 2>/dev/null || true
   fi
+  heartbeat_stop
   exit "$1"
 }
 trap 'on_signal 143 TERM' TERM
@@ -181,7 +254,9 @@ require_agent_env() {
 
 # Wrapper around the agent CLI used by every stage. The prompt goes in on the
 # command line and results come back as files the agent writes into the checkout
-# (.agent/*.json), so the CLI's own stdout is discarded for both backends.
+# (.agent/*.json). The CLI's stdout is no longer discarded: both backends can
+# emit their turns as NDJSON, which stream_filter.py summarises to stderr (so it
+# reaches `docker logs`) while keeping the full stream in RUN_DIR.
 #
 # Auto-approval (`--dangerously-skip-permissions` / `--yolo`) is acceptable ONLY
 # because the container is disposable, network-restricted, and has no host mounts
@@ -207,8 +282,9 @@ run_agent() { # run_agent <prompt> [extra agent args...]
   local -a cmd
   case "$AGENT_BACKEND" in
     claude)
+      # stream-json requires --verbose; without it the CLI refuses the combination.
       cmd=(claude -p "$prompt"
-           --output-format json
+           --output-format stream-json --verbose
            --dangerously-skip-permissions
            --max-turns "$turns")
       ;;
@@ -216,8 +292,12 @@ run_agent() { # run_agent <prompt> [extra agent args...]
       # `grok` prefers a session token in ~/.grok/auth.json over XAI_API_KEY; the
       # image ships no such file, so the key is always what authenticates.
       # --no-auto-update stops a disposable container re-downloading the binary.
+      #
+      # `streaming-messages-json` is Grok's NDJSON mode. It frames events with the
+      # same {"type":"system"|"assistant"|"user"|"result"} envelope Claude Code
+      # emits, so a single filter reads both backends.
       cmd=(grok -p "$prompt"
-           --output-format json
+           --output-format streaming-messages-json
            --yolo
            --no-auto-update
            --max-turns "$turns")
@@ -230,7 +310,49 @@ run_agent() { # run_agent <prompt> [extra agent args...]
 
   # ${args[@]+...} keeps an empty array safe under `set -u` on bash < 4.4.
   cmd+=(${args[@]+"${args[@]}"})
-  budget_guard "${cmd[@]}" >/dev/null
+
+  # A FIFO rather than a pipeline: `budget_guard | filter` would put the guard in
+  # a subshell, losing both BUDGET_GUARD_PID (so a SIGTERM could no longer stop
+  # the agent) and the guard's own exit status. This way the guard stays a direct
+  # child of this shell, its rc is read straight off it, and the filter is still
+  # `wait`ed on so the last events are never lost to a race at exit.
+  local fifo_dir fifo filter_pid rc=0
+  # Stale result from an earlier call would otherwise be reported as this call's
+  # cost -- Stage 1 invokes run_agent once per plan item into the same RUN_DIR.
+  rm -f "$RUN_DIR/agent-result.json"
+  fifo_dir="$(mktemp -d)"; fifo="$fifo_dir/agent.out"
+  mkfifo "$fifo"
+  RUN_DIR="$RUN_DIR" STAGE="${STAGE:-agent}" \
+    python3 -u "$AGENTIC_LIB/stream_filter.py" < "$fifo" &
+  filter_pid=$!
+
+  heartbeat_start
+  # </dev/null: the Claude CLI otherwise waits ~3s for piped stdin that is never
+  # coming, on every single invocation.
+  budget_guard "${cmd[@]}" < /dev/null > "$fifo" || rc=$?
+  heartbeat_stop
+  wait "$filter_pid" 2>/dev/null || true
+  rm -rf "$fifo_dir"
+
+  if [[ -r "$RUN_DIR/agent-result.json" ]]; then
+    log "${STAGE:-entrypoint}" "agent finished rc=$rc$(agent_usage_human)"
+  fi
+  return "$rc"
+}
+
+# Cost and token totals from the stream's final `result` event, in two shapes:
+# one for humans, one to splice into a ledger line. Both are empty when the agent
+# never got far enough to report -- callers must stay valid without them.
+agent_usage_human() {
+  [[ -r "$RUN_DIR/agent-result.json" ]] || return 0
+  jq -r '" cost=$\(.total_cost_usd // 0 | .*10000 | round / 10000) turns=\(.num_turns // "?") tokens=\(.usage.input_tokens // "?")/\(.usage.output_tokens // "?")"' \
+    "$RUN_DIR/agent-result.json" 2>/dev/null || true
+}
+
+agent_usage_fields() {
+  [[ -r "$RUN_DIR/agent-result.json" ]] || return 0
+  jq -rc '",\"cost_usd\":\(.total_cost_usd // 0),\"agent_turns\":\(.num_turns // 0),\"tokens_in\":\(.usage.input_tokens // 0),\"tokens_out\":\(.usage.output_tokens // 0)"' \
+    "$RUN_DIR/agent-result.json" 2>/dev/null || true
 }
 
 # Appends to the quota ledger that quota_reached() and the host launcher's
@@ -239,7 +361,8 @@ run_agent() { # run_agent <prompt> [extra agent args...]
 jlog() { # jlog <stage> <json-object-without-braces>
   local stage="$1"; shift
   mkdir -p "$RUNS_DIR/$stage"
-  printf '{"ts":"%s","run":"%s","stage":"%s",%s}\n' "$(date -Iseconds)" "$RUN_ID" "$stage" "$*" \
+  printf '{"ts":"%s","run":"%s","stage":"%s",%s%s}\n' \
+    "$(date -Iseconds)" "$RUN_ID" "$stage" "$*" "$(agent_usage_fields)" \
     >> "$RUNS_DIR/$stage/$(date +%F).jsonl"
   JLOG_WRITTEN=1
 }

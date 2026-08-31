@@ -70,7 +70,7 @@ lint: ## Syntax-check every script (shellcheck too, if installed)
 	@for f in $(SCRIPTS); do bash -n "$$f" && echo "bash -n   ok: $$f"; done
 	@if command -v shellcheck >/dev/null; then shellcheck -x -P SCRIPTDIR $(SCRIPTS) && echo "shellcheck ok"; \
 	 else echo "shellcheck not installed; skipped"; fi
-	@python3 -m py_compile agentic/lib/parse_plan.py && echo "py_compile ok: parse_plan.py"
+	@for f in agentic/lib/*.py; do python3 -m py_compile "$$f" && echo "py_compile ok: $$(basename $$f)"; done
 
 parse: ## Run the plan.md parser (PLAN=path/to/plan.md)
 	python3 agentic/lib/parse_plan.py $(PLAN)
