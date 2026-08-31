@@ -26,6 +26,7 @@ analysis.
 agentic-dev-plan.md            design doc (read this for the "why")
 README.md                      this file
 Dockerfile                     builds agentic-dev:{claude,grok}-latest
+.dockerignore                  build context is an allowlist: agentic/ only
 Makefile                       build / run / operate targets (`make help`)
 examples/plan.md               sample plan.md the slicer consumes
 agentic/
@@ -35,7 +36,10 @@ agentic/
     implement.sh               Stage 3  — failing tests -> green -> PR (env: ISSUE)
     gc.sh                      housekeeping
   lib/
-    common.sh                  shared bash helpers
+    common.sh                  shared bash helpers: phases, the exit trap,
+                               budget_guard, run_agent, the heartbeat
+    stream_filter.py           summarises the agent's NDJSON stream to one line
+                               per event; flags repeated tool calls as a loop
     parse_plan.py              plan.md checklist parser
   host/                        run ON the cron host
     run-stage.sh               selects work with gh, launches one container per unit
