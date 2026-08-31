@@ -28,7 +28,7 @@ REPO     ?= $(shell sh -c '. $(ENV_FILE) 2>/dev/null && echo $$REPO')
 .PHONY: help build build-claude build-grok build-all \
         rebuild rebuild-claude rebuild-grok rebuild-all lint parse \
         slice slice-dry write-tests implement gc gc-apply run-issue \
-        status logs labels install-cron uninstall-cron pause resume clean
+        status logs phase watch labels install-cron uninstall-cron pause resume clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -117,6 +117,22 @@ status: ## Show pipeline state from GitHub (needs REPO or a readable ENV_FILE)
 
 logs: ## Tail the stage logs
 	tail -n 40 -F $(LOG_DIR)/*.log
+
+phase: ## Show what every run today is doing right now (STAGE=... to filter one)
+	@d=$(RUNS_DIR); today=$$(date +%F); found=0; \
+	for p in $$d/*/$$today/*/phase; do \
+	  [ -e "$$p" ] || continue; \
+	  run=$$(dirname $$p); stage=$$(basename $$(dirname $$(dirname $$run))); \
+	  case "$(STAGE)" in "") ;; $$stage) ;; *) continue ;; esac; \
+	  found=1; \
+	  printf '%-12s %-6s %-16s %s\n' "$$stage" "$$(basename $$run)" "$$(cat $$p)" \
+	    "last change $$(( ($$(date +%s) - $$(date -r $$p +%s)) ))s ago"; \
+	done; \
+	[ $$found = 1 ] || echo "no runs recorded under $$d for $$today"
+
+watch: ## Follow one run's phase trail (STAGE=implement ISSUE=42)
+	@test -n "$(ISSUE)" || { echo "usage: make watch STAGE=<stage> ISSUE=<n>"; exit 2; }
+	tail -n +1 -F $(RUNS_DIR)/$(STAGE)/$$(date +%F)/$(ISSUE)/phases.jsonl
 
 labels: ## Create the pipeline labels in REPO (idempotent)
 	@test -n "$(REPO)" || { echo "set REPO=owner/name"; exit 2; }

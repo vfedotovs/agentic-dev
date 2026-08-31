@@ -22,6 +22,26 @@ require_agent_env
 
 quota_reached "$STAGE" && die "daily quota (${MAX_PER_DAY:-10}) already reached"
 
+# Stage 3 is the only stage that takes a lock on the issue (the `in-progress`
+# label). Set once that label is on and cleared once the run has settled it one
+# way or the other; while it is 1, an exit of any kind — a killed agent
+# included — has left the issue claimed by a container that no longer exists.
+LABEL_HELD=0
+
+# Called by common.sh's exit trap before the ledger line is written.
+on_stage_exit() { # on_stage_exit <rc> <status>
+  local rc="$1" status="$2"
+  (( LABEL_HELD == 1 )) || return 0
+  log "$STAGE" "releasing in-progress on #$ISSUE (died in $PHASE, $status)"
+  gh issue edit "$ISSUE" --repo "$REPO" \
+    --remove-label in-progress --add-label agent-failed >/dev/null 2>&1 || true
+  gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 3 ended in \`$PHASE\`** — \`$status\` (exit $rc) after ${SECONDS}s.
+
+No PR was opened and the \`in-progress\` claim has been released. Phase trail: \`$RUN_DIR/phases.jsonl\` (run \`$RUN_ID\`)." >/dev/null 2>&1 || true
+  LABEL_HELD=0
+}
+
+phase issue-fetch
 meta="$(gh issue view "$ISSUE" --repo "$REPO" --json number,title,body,labels)"
 labels="$(jq -r '.labels[].name' <<<"$meta")"
 grep -qx  'tests-ready'            <<<"$labels" || die "#$ISSUE is not in tests-ready state"
@@ -32,10 +52,12 @@ slug="$(tr '[:upper:]' '[:lower:]' <<<"$title" | tr -cs 'a-z0-9' '-' | sed 's/^-
 tests_branch="agent/tests/${ISSUE}-${slug}"
 impl_branch="agent/impl/${ISSUE}-${slug}"
 
+phase clone
 workdir="$(clone_repo)"; cd "$workdir"
 base="$(default_branch)"
 git rev-parse --verify "origin/$tests_branch" >/dev/null 2>&1 || die "missing tests branch $tests_branch"
 
+phase rebase
 git checkout -b "$impl_branch" "origin/$tests_branch"
 if ! git rebase "origin/$base"; then
   git rebase --abort || true
@@ -46,11 +68,15 @@ if ! git rebase "origin/$base"; then
 fi
 
 gh issue edit "$ISSUE" --repo "$REPO" --remove-label tests-ready --add-label in-progress
+LABEL_HELD=1
 
 mkdir -p .agent
 jq -r .body <<<"$meta" > .agent/issue.md
 git diff "origin/$base...HEAD" -- tests/ conftest.py > .agent/tests.patch || true
 
+# 120 turns of edit/test iteration, and until the stream lands the whole of it
+# is silent. This marker is what a stuck run is diagnosed by.
+phase agent
 run_agent "Read .agent/issue.md (the issue) and .agent/tests.patch (failing tests
 already committed to this branch).
 
@@ -69,8 +95,11 @@ When green, write .agent/impl.json with keys:
   --max-turns 120
 
 # --- acceptance gate --------------------------------------------------------
+phase gate-pytest
 gate_ok=1
 pytest -q                                   || gate_ok=0
+
+phase gate-lint
 if command -v ruff  >/dev/null; then ruff check .      || gate_ok=0; fi
 if command -v black >/dev/null; then black --check .   || gate_ok=0; fi
 if command -v mypy  >/dev/null && { [[ -f mypy.ini ]] || grep -q '\[tool.mypy\]' pyproject.toml 2>/dev/null; }; then
@@ -78,6 +107,7 @@ if command -v mypy  >/dev/null && { [[ -f mypy.ini ]] || grep -q '\[tool.mypy\]'
 fi
 
 # tests must be untouched vs the Stage 2 branch unless the agent justified edits
+phase gate-tests-untouched
 test_delta="$(git diff "origin/$tests_branch...HEAD" -- tests/ conftest.py | wc -l)"
 justified="$(jq -r '.test_edits | length' .agent/impl.json 2>/dev/null || echo 0)"
 if (( test_delta > 0 && justified == 0 )); then
@@ -88,11 +118,15 @@ fi
 git add -A
 
 if (( gate_ok == 1 )) && [[ -f .agent/impl.json ]]; then
+  phase commit
   git commit -m "feat: implement #${ISSUE}
 
 Closes #${ISSUE}"
+
+  phase push
   git push -u origin "$impl_branch"
 
+  phase pr-create
   summary="$(jq -r .summary .agent/impl.json)"
   files="$(jq -r '.files_changed[]? | "- `\(.)`"' .agent/impl.json)"
   pr_url="$(gh pr create --repo "$REPO" --base "$base" --head "$impl_branch" \
@@ -113,15 +147,20 @@ ${files:-_none reported_}
 _Opened by agentic-dev. Human review required — no auto-merge._" \
     --label agent-pr-open)"
 
+  phase gh-report
   gh issue edit "$ISSUE" --repo "$REPO" --remove-label in-progress --add-label agent-pr-open
+  LABEL_HELD=0
   gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 3 complete** — PR: $pr_url"
   jlog "$STAGE" "\"issue\":$ISSUE,\"branch\":\"$impl_branch\",\"pr\":\"$pr_url\",\"status\":\"open\""
   log "$STAGE" "done #$ISSUE -> $pr_url"
 else
+  phase fail-commit
   git commit -m "wip: partial work for #${ISSUE} (agent did not reach green)
 
 Refs #${ISSUE}" || true
   git push -u origin "$impl_branch" || true
+
+  phase fail-pr
   pr_url="$(gh pr create --repo "$REPO" --base "$base" --head "$impl_branch" --draft \
     --title "[WIP] $title" \
     --body "Refs #${ISSUE}
@@ -131,7 +170,9 @@ for a human to take over.
 
 <!-- agent-pipeline: stage3 -->" 2>/dev/null || echo "(no PR created)")"
 
+  phase fail-report
   gh issue edit "$ISSUE" --repo "$REPO" --remove-label in-progress --add-label agent-failed
+  LABEL_HELD=0
   gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 3 FAILED** — draft: $pr_url
 
 Last test output:
