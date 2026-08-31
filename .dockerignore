@@ -1,0 +1,32 @@
+# The Dockerfile COPYs exactly one thing -- `agentic/` -- so the build context is
+# an allowlist: exclude everything, add back that one directory, then re-exclude
+# the artefacts that can appear inside it.
+#
+# The concrete bug this prevents: running `make lint` or `make parse` on the host
+# leaves agentic/lib/__pycache__ behind, and COPY reads the filesystem rather than
+# git, so that host bytecode was shipped inside the image -- cpython-314 .pyc
+# files from a developer's macOS Python sitting in a python:3.12 image. Harmless
+# in itself (CPython ignores bytecode tagged for another version, and the stages
+# run the filter as a script) but it made the image's contents depend on whatever
+# happened to have been run before the build.
+#
+# Note the `**/`: unlike .gitignore, a bare `__pycache__/` here matches only at
+# the context root, not at any depth. That is exactly the mistake this file was
+# first written with.
+#
+# If a future Dockerfile needs another path from the repo, add a `!` line for it.
+
+# 1. nothing by default -- this also keeps .git out of the build context
+*
+
+# 2. the only thing the image actually needs
+!agentic/
+
+# 3. artefacts that can appear inside agentic/
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.DS_Store
+**/*.swp
