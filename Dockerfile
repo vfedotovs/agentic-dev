@@ -35,8 +35,10 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # --- python tooling used by the Stage 3 acceptance gate ----------------------
+# pytest-timeout backs PYTEST_TIMEOUT in the Stage 3 gate: a hanging test then
+# fails loudly instead of consuming the container's remaining wallclock budget.
 RUN pip install --no-cache-dir \
-        pytest pytest-cov coverage ruff black mypy
+        pytest pytest-cov pytest-timeout coverage ruff black mypy
 
 # --- agent runtime: exactly one of the two backends -------------------------
 #
