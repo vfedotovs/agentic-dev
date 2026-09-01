@@ -59,7 +59,10 @@ RUN pip install --no-cache-dir \
 ARG AGENT_BACKEND=claude
 ARG CLAUDE_CODE_VERSION=latest
 ARG GROK_CLI_VERSION=
-ARG NODE_MAJOR=20
+# claude-code declares engines.node >=22. npm installs under 20 anyway with only
+# an EBADENGINE warning, so the build stayed green while the CLI ran on an
+# engine its authors do not support -- CI surfaced this on the first run.
+ARG NODE_MAJOR=22
 RUN set -eux; \
     case "$AGENT_BACKEND" in \
       claude) \
