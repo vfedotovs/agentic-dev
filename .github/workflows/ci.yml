@@ -1,0 +1,71 @@
+# CI for agentic-dev — the checks that gate a merge into main.
+#
+# Two of these three jobs are wired into the `main-protection` ruleset as
+# required status checks: `lint` and `build (claude)`. A red run on either one
+# takes the merge button away.
+#
+# `build (grok)` deliberately is NOT required. It installs the Grok CLI from
+# x.ai's install script, so an outage on x.ai's side would wedge every open PR
+# behind a check that has nothing to do with the change. It still runs and still
+# reports — it just cannot block. Promote it to required if that install ever
+# proves reliable enough to bet the merge button on.
+#
+# Everything here shells out to the Makefile rather than restating the commands,
+# so `make lint` on a laptop and `lint` in CI cannot drift apart.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Three pushes in a minute only need the last one checked. Superseded PR runs are
+# cancelled; runs on main are not, so every commit on the default branch keeps a
+# result of its own.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only: nothing here comments, pushes, or publishes.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # `make lint` skips shellcheck with a notice when it is absent rather than
+      # failing, which is right for a laptop and wrong for CI — install it so the
+      # skip path is never the reason CI is green.
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: bash -n, shellcheck, py_compile
+        run: make lint
+
+      # Cheap smoke test with real input: the parser is what turns a plan into
+      # issues, so a traceback here means Stage 1 is broken.
+      - name: Parse the example plan
+        run: make parse
+
+  build:
+    name: build (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One backend failing should not hide the other backend's result.
+      fail-fast: false
+      matrix:
+        backend: [claude, grok]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the ${{ matrix.backend }} image
+        run: make build-${{ matrix.backend }}

@@ -33,6 +33,8 @@ env_loaded=0
 trap '(( env_loaded )) || echo "run-stage: failed to load $ENV_FILE (see the error above; a value containing spaces must be quoted)" >&2' EXIT
 set -a; # shellcheck disable=SC1090
 source "$ENV_FILE"; set +a
+# shellcheck disable=SC2034  # used, but only inside the single-quoted trap above,
+# which shellcheck reads as a string rather than as code.
 env_loaded=1; trap - EXIT
 if [[ -n "$backend_override" ]]; then AGENT_BACKEND="$backend_override"; fi
 
