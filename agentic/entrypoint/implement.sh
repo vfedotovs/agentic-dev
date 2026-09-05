@@ -165,17 +165,22 @@ When green, write .agent/impl.json with keys:
 # finished, so a hanging suite added yet more unexplained quiet. Tee'd to the run
 # dir, and PYTEST_TIMEOUT (pytest-timeout, installed in the image) makes a stuck
 # test fail loudly instead of eating the container's remaining budget.
+# Which check failed is the whole story of a failed run, and it used to be the
+# one thing the run did not record: the issue comment quoted the tail of
+# pytest.log whatever had failed, so a run rejected by ruff or by the
+# tests-untouched check reported "FAILED" directly above a green "37 passed".
 phase gate-pytest
 gate_ok=1
+gate_failed=()
 PYTEST_TIMEOUT="${PYTEST_TIMEOUT:-300}" pytest -q --color=no 2>&1 \
-  | tee "$RUN_DIR/pytest.log" || gate_ok=0
+  | tee "$RUN_DIR/pytest.log" || { gate_ok=0; gate_failed+=("pytest"); }
 log "$STAGE" "gate pytest: $(tail -n 1 "$RUN_DIR/pytest.log" 2>/dev/null || echo 'no output')"
 
 phase gate-lint
-if command -v ruff  >/dev/null; then ruff check .      || gate_ok=0; fi
-if command -v black >/dev/null; then black --check .   || gate_ok=0; fi
+if command -v ruff  >/dev/null; then ruff check .    || { gate_ok=0; gate_failed+=("ruff"); }; fi
+if command -v black >/dev/null; then black --check . || { gate_ok=0; gate_failed+=("black"); }; fi
 if command -v mypy  >/dev/null && { [[ -f mypy.ini ]] || grep -q '\[tool.mypy\]' pyproject.toml 2>/dev/null; }; then
-  mypy . || gate_ok=0
+  mypy . || { gate_ok=0; gate_failed+=("mypy"); }
 fi
 
 # tests must be untouched vs the Stage 2 branch unless the agent justified edits
@@ -184,12 +189,22 @@ test_delta="$(git diff "$tests_head" -- tests/ conftest.py | wc -l)"
 justified="$(jq -r '.test_edits | length' .agent/impl.json 2>/dev/null || echo 0)"
 if (( test_delta > 0 && justified == 0 )); then
   gate_ok=0
+  gate_failed+=("tests-untouched ($test_delta lines changed, none justified)")
   log "$STAGE" "tests changed ($test_delta lines) with no justification in impl.json"
 fi
 
+# A missing impl.json blocks the PR exactly like a failed check, so it is named
+# like one rather than silently steering the run into the failure branch.
+if [[ ! -f .agent/impl.json ]]; then
+  gate_ok=0
+  gate_failed+=("no impl.json written by the agent")
+fi
+
+gate_summary="$(printf '%s\n' ${gate_failed[@]+"${gate_failed[@]}"} | sed '/^$/d' | sed 's/^/- /')"
+
 git add -A
 
-if (( gate_ok == 1 )) && [[ -f .agent/impl.json ]]; then
+if (( gate_ok == 1 )); then
   phase commit
   git commit -m "feat: implement #${ISSUE}
 
@@ -230,31 +245,63 @@ _Opened by agentic-dev. Human review required — no auto-merge._" \
   jlog "$STAGE" "\"issue\":$ISSUE,\"branch\":\"$impl_branch\",\"pr\":\"$pr_url\",\"status\":\"open\""
   log "$STAGE" "done #$ISSUE -> $pr_url"
 else
+  # Every step on the way out used to end in `|| true` or `2>/dev/null`, so a
+  # failure here reported "(no PR created)" and nothing else -- not whether the
+  # commit was empty, not whether the push was rejected, not what git said. The
+  # work is on a branch nobody can find and the reason is in a container that no
+  # longer exists. Each step now keeps its error and puts it in the comment.
   phase fail-commit
-  git commit -m "wip: partial work for #${ISSUE} (agent did not reach green)
+  handoff=()
+  if ! git commit -m "wip: partial work for #${ISSUE} (agent did not reach green)
 
-Refs #${ISSUE}" || true
-  git push -u origin "$impl_branch" || true
+Refs #${ISSUE}" >"$RUN_DIR/fail-commit.log" 2>&1; then
+    handoff+=("Nothing to commit — the agent left no changes on \`$impl_branch\`.")
+    log "$STAGE" "fail-path commit: $(tail -n 1 "$RUN_DIR/fail-commit.log" 2>/dev/null)"
+  fi
+
+  phase fail-push
+  if git push -u origin "$impl_branch" >"$RUN_DIR/fail-push.log" 2>&1; then
+    pushed=1
+  else
+    pushed=0
+    handoff+=("Push of \`$impl_branch\` FAILED: \`$(tail -n 2 "$RUN_DIR/fail-push.log" | tr '\n' ' ')\` — the work exists only in the container and is gone.")
+    log "$STAGE" "fail-path push failed: $(tail -n 1 "$RUN_DIR/fail-push.log" 2>/dev/null)"
+  fi
 
   phase fail-pr
-  pr_url="$(gh pr create --repo "$REPO" --base "$base" --head "$impl_branch" --draft \
-    --title "[WIP] $title" \
-    --body "Refs #${ISSUE}
+  if (( pushed == 1 )); then
+    pr_url="$(gh pr create --repo "$REPO" --base "$base" --head "$impl_branch" --draft \
+      --title "[WIP] $title" \
+      --body "Refs #${ISSUE}
 
 The agent could not reach a green build within budget. Last state is pushed here
 for a human to take over.
 
-<!-- agent-pipeline: stage3 -->" 2>/dev/null || echo "(no PR created)")"
+## Checks that failed
+${gate_summary:-- _not recorded_}
+
+<!-- agent-pipeline: stage3 -->" 2>"$RUN_DIR/fail-pr.log")" || {
+      pr_url="(no PR created)"
+      handoff+=("\`gh pr create\` FAILED: \`$(tail -n 2 "$RUN_DIR/fail-pr.log" | tr '\n' ' ')\`")
+    }
+  else
+    pr_url="(no PR created — nothing was pushed)"
+  fi
 
   phase fail-report
   gh issue edit "$ISSUE" --repo "$REPO" --remove-label in-progress --add-label agent-failed
   LABEL_HELD=0
   gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 3 FAILED** — draft: $pr_url
 
-Last test output:
+## Checks that failed
+${gate_summary:-- _not recorded_}
+$(printf '%s\n' ${handoff[@]+"${handoff[@]}"} | sed '/^$/d' | sed 's/^/- /')
+
+Last test output (green here does NOT mean the run passed — see the failed
+checks above):
 \`\`\`
 $(tail -n 40 "$RUN_DIR/pytest.log" 2>/dev/null || echo '(no pytest output captured)')
 \`\`\`"
-  jlog "$STAGE" "\"issue\":$ISSUE,\"branch\":\"$impl_branch\",\"pr\":\"$pr_url\",\"status\":\"failed\""
+  jlog "$STAGE" "\"issue\":$ISSUE,\"branch\":\"$impl_branch\",\"pr\":\"$pr_url\",\"status\":\"failed\",\"failed_checks\":\"$(tr '\n' ',' <<<"${gate_failed[*]+"${gate_failed[*]}"}")\""
   die "acceptance gate failed for #$ISSUE"
 fi
