@@ -47,17 +47,22 @@ jq -r .body <<<"$meta" > .agent/issue.md
 phase agent
 run_agent "Read .agent/issue.md — a GitHub issue for this Python project.
 
-Write pytest tests (under tests/) that will pass ONLY once the described change
-is correctly implemented. Cover every acceptance criterion. You MAY add fixtures,
-helpers, and conftest.py entries. You MUST NOT modify any application/source
-file — tests and conftest.py only.
+Write pytest tests that will pass ONLY once the described change is correctly
+implemented. Cover every acceptance criterion.
 
-Keep your fixtures in the test module you add. Every other open issue is being
-worked on its own branch cut from the same commit, and tests/conftest.py is the
-one file all of them share: a whole conftest.py written here collides with
-theirs the moment one of the branches merges. Touch tests/conftest.py only for
-something that genuinely has to be shared across modules, append rather than
-rewrite, and name what you add after this issue.
+Put everything you add in a directory of your own: tests/issue-${ISSUE}/.
+Test modules go there, and any fixtures go in
+tests/issue-${ISSUE}/conftest.py, which pytest applies to that directory
+automatically. You may READ and import from the existing test files -- e.g.
+'from tests.conftest import write_csv' -- but you MUST NOT modify ANY file that
+already exists, test files and application/source files alike. Create new files
+only.
+
+That is not style, it is the one thing that makes these branches mergeable.
+Every other open issue is being worked on its own branch cut from this same
+commit; a shared file you edit becomes a merge conflict for all of them the
+moment one branch lands, and tests/conftest.py is the file every one of them
+reaches for. A directory of your own can never collide.
 
 The new tests MUST FAIL now, and fail for the RIGHT reason (assertion failure or
 a deliberate 'not implemented' — never a collection or import error). Fix any
@@ -70,8 +75,12 @@ When done, write .agent/report.json with keys:
   --max-turns 60
 
 # --- guard: only tests/ and conftest.py may change -----------------------------
+# .agent/ is excluded from the clone (see clone_repo), so what is left here is
+# the agent's own work and nothing of the pipeline's.
 phase diff-guard
-changed="$( { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u )"
+modified="$(git diff --name-only)"
+added="$(git ls-files --others --exclude-standard)"
+changed="$(printf '%s\n%s\n' "$modified" "$added" | sed '/^$/d' | sort -u)"
 offending="$(grep -vE '^(tests/|conftest\.py$)' <<<"$changed" || true)"
 if [[ -n "$offending" ]]; then
   gh issue edit "$ISSUE" --repo "$REPO" --add-label agent-failed
@@ -81,6 +90,26 @@ $offending
 \`\`\`"
   jlog "$STAGE" "\"issue\":$ISSUE,\"status\":\"non-test-files\""
   die "non-test files changed"
+fi
+
+# --- guard: add files, never edit them ----------------------------------------
+# Editing a file that already exists is how every one of these branches ends up
+# fighting over tests/conftest.py: they are all cut from the same commit, so the
+# first to land leaves the rest with an add/add conflict on it. Stage 3 can
+# sometimes merge that back together, but the cheaper fix is upstream -- a
+# branch that only adds files cannot conflict with a sibling that does the same.
+phase collision-guard
+if [[ -n "$modified" ]]; then
+  gh issue edit "$ISSUE" --repo "$REPO" --add-label agent-failed
+  gh issue comment "$ISSUE" --repo "$REPO" --body "**Stage 2 aborted** — agent edited existing test files instead of adding its own:
+\`\`\`
+$modified
+\`\`\`
+Stage 2 may only create files, under \`tests/issue-$ISSUE/\`. Every open issue
+branches from the same commit, so an edit to a shared file — \`tests/conftest.py\`
+above all — becomes a merge conflict for every other branch as soon as one lands."
+  jlog "$STAGE" "\"issue\":$ISSUE,\"status\":\"edited-existing-files\""
+  die "existing files modified: $(tr '\n' ' ' <<<"$modified")"
 fi
 
 phase report-check

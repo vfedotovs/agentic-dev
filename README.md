@@ -160,8 +160,8 @@ Default times (host-local): `gc` 02:00, `slice` 06:00, `write-tests` 08:00,
 | Stage | Trigger | Input | Output | Guardrails |
 | --- | --- | --- | --- | --- |
 | **1 slice** | daily | `plan.md` unchecked items | issues labelled `agent-generated`,`needs-tests`,`<type>` | fingerprint dedupe; `MAX_ISSUES` cap; `SLICER_DRY_RUN` |
-| **2 write-tests** | daily, ≤`MAX_PER_DAY` | issue `needs-tests` + type ∈ {feature,bug,refactor} | branch `agent/tests/<n>-<slug>` with **failing** pytest tests; label → `tests-ready` | diff must touch only `tests/` + `conftest.py`; new tests must actually fail (else `needs-triage`) |
-| **3 implement** | daily, ≤`MAX_PER_DAY` | issue `tests-ready` | PR `Closes #<n>`, label → `agent-pr-open` | rebases onto base first (a conflict confined to `tests/` is merged by the agent and re-checked; anything else stops for a human); gate = pytest + ruff + black + mypy + tests-unchanged; failure → **draft** PR + `agent-failed` |
+| **2 write-tests** | daily, ≤`MAX_PER_DAY` | issue `needs-tests` + type ∈ {feature,bug,refactor} | branch `agent/tests/<n>-<slug>` with **failing** pytest tests; label → `tests-ready` | diff must stay under `tests/` + `conftest.py` **and may only add files**, in `tests/issue-<n>/`, so sibling branches cannot collide on `tests/conftest.py`; new tests must actually fail (else `needs-triage`) |
+| **3 implement** | daily, ≤`MAX_PER_DAY` | issue `tests-ready` | PR `Closes #<n>`, label → `agent-pr-open` | rebases onto base first (a conflict confined to `tests/` is merged by the agent and re-checked; anything else stops for a human); gate = pytest + ruff + black + mypy + tests-unchanged + an `impl.json` report; failure → **draft** PR + `agent-failed`, with the checks that failed named in the issue comment |
 | **gc** | daily | — | deletes stale/merged `agent/*` branches, closes inactive agent PRs, resets stuck `in-progress` issues | only touches `agent/tests/*` `agent/impl/*`; `GC_DRY_RUN` |
 
 Humans interact by: reviewing/merging PRs, adding **`agent-skip`** to any issue
@@ -409,6 +409,7 @@ sudo -u agentic crontab -r
 | Stage 1 creates nothing | No `plan.md`, all items checked/already sliced, or `SLICER_DRY_RUN=1`. |
 | Stage 2 labels issue `needs-triage` | New tests passed immediately — behaviour may already exist; a human decides. |
 | Stage 2 aborts "non-test files changed" | The agent edited source; the issue gets `agent-failed`. Sharpen the acceptance criteria and retry. |
+| Stage 2 aborts "edited existing test files" | The agent appended to a shared file (almost always `tests/conftest.py`) instead of creating `tests/issue-<n>/`. That edit is what makes two sibling branches conflict once the first one merges, so it is rejected at the source. Retry. |
 | Stage 3 opens a **draft** PR + `agent-failed` | Couldn't reach green within budget; last `pytest` output is in the issue comment. Take over manually or raise `CONTAINER_TIMEOUT`. |
 | Stage 3 aborts "rebase conflict" | Reported with a reason. `conflicts outside tests/` is a real clash with base — rebase by hand or re-slice. `conflict markers left` / `resolution dropped` / `do not collect` mean the agent's own merge of a test-file conflict failed its checks; the branch is untouched, so retry or merge by hand. |
 | Issue stuck in `in-progress` | Stage 3 container died; next `gc` run resets it to `tests-ready` (after `GC_INPROGRESS_HOURS`). |

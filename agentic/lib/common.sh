@@ -27,6 +27,14 @@ clone_repo() { # echoes the checkout path on stdout; all noise goes to stderr
   gh repo clone "$REPO" "$dir" -- --depth "${CLONE_DEPTH:-50}" --no-single-branch >&2
   git -C "$dir" config user.name  "${GIT_AUTHOR_NAME:-agentic-dev bot}"
   git -C "$dir" config user.email "${GIT_AUTHOR_EMAIL:-agentic-dev@users.noreply.github.com}"
+  # .agent/ is this pipeline's scratch space: the issue body handed to the agent
+  # and the report handed back. It is not the target repo's business, and until
+  # it is excluded every stage sees its own scratch as work the agent did --
+  # `git ls-files --others` reports .agent/issue.md and .agent/report.json to the
+  # diff guard, and `git add -A` commits them. Excluded here rather than in each
+  # stage so one rule covers all of them, and via info/exclude rather than the
+  # upstream .gitignore because it is our mess, not the repo's.
+  echo '.agent/' >> "$dir/.git/info/exclude"
   git -C "$dir" fetch --all --prune >&2
   echo "$dir"
 }
